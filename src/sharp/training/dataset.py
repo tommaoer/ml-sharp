@@ -34,30 +34,27 @@ class FrameRecord:
 class ViewPairSample:
     """A training pair consisting of an input view and a target view."""
 
+    scene_name: str
     source: FrameRecord
     target: FrameRecord
     disparity_factor: torch.Tensor
 
 
-class PosedVideoDataset(Dataset[ViewPairSample]):
-    """Loads a single video sequence with per-frame camera intrinsics/extrinsics."""
+class PosedVideoScene:
+    """Represents one video sequence with per-frame camera intrinsics/extrinsics."""
 
     def __init__(
         self,
         video_path: str | Path,
         pose_path: str | Path,
         internal_resolution: tuple[int, int] = (1536, 1536),
-        min_frame_distance: int = 4,
-        max_frame_distance: int = 48,
-        samples_per_epoch: int | None = None,
         preload: bool = False,
     ) -> None:
-        """Initialize the dataset."""
+        """Initialize one posed-video scene."""
         self.video_path = Path(video_path)
         self.pose_path = Path(pose_path)
+        self.scene_name = self.video_path.parent.name
         self.internal_resolution = internal_resolution
-        self.min_frame_distance = min_frame_distance
-        self.max_frame_distance = max_frame_distance
         self.preload = preload
 
         with self.pose_path.open("r", encoding="utf-8") as handle:
@@ -69,11 +66,10 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
 
         self.num_frames = int(self.c2ws.shape[0])
         if self.num_frames < 2:
-            raise ValueError("At least two frames are required for fine-tuning.")
+            raise ValueError(f"Scene {self.scene_name} must contain at least two frames.")
 
         self.intrinsics = self._create_intrinsics(metadata)
         self.frames = self._load_video_frames() if preload else None
-        self.samples_per_epoch = samples_per_epoch or self.num_frames
 
     @staticmethod
     def _create_intrinsics(metadata: dict[str, Any]) -> torch.Tensor:
@@ -99,7 +95,8 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
             frame = np.repeat(frame[..., None], repeats=3, axis=-1)
         return torch.from_numpy(frame[..., :3].copy()).float().permute(2, 0, 1) / 255.0
 
-    def _load_frame(self, frame_index: int) -> torch.Tensor:
+    def load_frame(self, frame_index: int) -> torch.Tensor:
+        """Load one RGB frame from the scene video."""
         if self.frames is not None:
             return self.frames[frame_index].clone()
         reader = iio.get_reader(self.video_path)
@@ -122,8 +119,9 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
         scaled[1] *= float(target_height) / float(height)
         return scaled
 
-    def _build_frame_record(self, frame_index: int) -> FrameRecord:
-        image = self._load_frame(frame_index)
+    def build_frame_record(self, frame_index: int) -> FrameRecord:
+        """Build one frame record with resized image and scaled intrinsics."""
+        image = self.load_frame(frame_index)
         _, height, width = image.shape
         target_height, target_width = self.internal_resolution
         image = F.interpolate(
@@ -146,16 +144,39 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
             frame_index=frame_index,
         )
 
+
+class PosedVideoDataset(Dataset[ViewPairSample]):
+    """Loads a single video sequence with per-frame camera intrinsics/extrinsics."""
+
+    def __init__(
+        self,
+        video_path: str | Path,
+        pose_path: str | Path,
+        internal_resolution: tuple[int, int] = (1536, 1536),
+        min_frame_distance: int = 4,
+        max_frame_distance: int = 48,
+        samples_per_epoch: int | None = None,
+        preload: bool = False,
+    ) -> None:
+        """Initialize the dataset."""
+        self.scene = PosedVideoScene(
+            video_path=video_path,
+            pose_path=pose_path,
+            internal_resolution=internal_resolution,
+            preload=preload,
+        )
+        self.min_frame_distance = min_frame_distance
+        self.max_frame_distance = max_frame_distance
+        self.samples_per_epoch = samples_per_epoch or self.scene.num_frames
+
     def _sample_target_index(self, source_index: int) -> int:
         candidates = [
             index
-            for index in range(self.num_frames)
+            for index in range(self.scene.num_frames)
             if self.min_frame_distance <= abs(index - source_index) <= self.max_frame_distance
         ]
         if not candidates:
-            candidates = [
-                index for index in range(self.num_frames) if index != source_index
-            ]
+            candidates = [index for index in range(self.scene.num_frames) if index != source_index]
         if not candidates:
             raise ValueError("Could not sample a target frame different from the source frame.")
         return random.choice(candidates)
@@ -165,20 +186,109 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
 
     def __getitem__(self, index: int) -> ViewPairSample:
         del index
-        source_index = random.randrange(self.num_frames)
+        source_index = random.randrange(self.scene.num_frames)
         target_index = self._sample_target_index(source_index)
 
-        source = self._build_frame_record(source_index)
-        target = self._build_frame_record(target_index)
+        source = self.scene.build_frame_record(source_index)
+        target = self.scene.build_frame_record(target_index)
         disparity_factor = torch.tensor(
             [source.intrinsics[0, 0] / float(source.image.shape[-1])], dtype=torch.float32
         )
-        return ViewPairSample(source=source, target=target, disparity_factor=disparity_factor)
+        return ViewPairSample(
+            scene_name=self.scene.scene_name,
+            source=source,
+            target=target,
+            disparity_factor=disparity_factor,
+        )
+
+
+class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
+    """Loads many scene folders, each containing one video and one pose json."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        internal_resolution: tuple[int, int] = (1536, 1536),
+        min_frame_distance: int = 4,
+        max_frame_distance: int = 48,
+        samples_per_scene: int = 32,
+        preload: bool = False,
+        video_extensions: tuple[str, ...] = (".mp4", ".MP4"),
+    ) -> None:
+        """Initialize the multi-scene dataset."""
+        self.data_root = Path(data_root)
+        self.min_frame_distance = min_frame_distance
+        self.max_frame_distance = max_frame_distance
+        self.samples_per_scene = samples_per_scene
+
+        scene_dirs = sorted(path for path in self.data_root.iterdir() if path.is_dir())
+        if not scene_dirs:
+            raise ValueError(f"No scene folders found in {self.data_root}.")
+
+        self.scenes = []
+        for scene_dir in scene_dirs:
+            video_candidates = [
+                path
+                for path in sorted(scene_dir.iterdir())
+                if path.is_file() and path.suffix in video_extensions
+            ]
+            json_candidates = [
+                path
+                for path in sorted(scene_dir.iterdir())
+                if path.is_file() and path.suffix == ".json"
+            ]
+            if len(video_candidates) != 1 or len(json_candidates) != 1:
+                raise ValueError(
+                    f"Each scene folder must contain exactly one video and one json: {scene_dir}."
+                )
+            self.scenes.append(
+                PosedVideoScene(
+                    video_candidates[0],
+                    json_candidates[0],
+                    internal_resolution=internal_resolution,
+                    preload=preload,
+                )
+            )
+
+    def _sample_target_index(self, scene: PosedVideoScene, source_index: int) -> int:
+        candidates = [
+            index
+            for index in range(scene.num_frames)
+            if self.min_frame_distance <= abs(index - source_index) <= self.max_frame_distance
+        ]
+        if not candidates:
+            candidates = [index for index in range(scene.num_frames) if index != source_index]
+        if not candidates:
+            raise ValueError(
+                f"Could not sample a target frame different from the source in {scene.scene_name}."
+            )
+        return random.choice(candidates)
+
+    def __len__(self) -> int:
+        return len(self.scenes) * self.samples_per_scene
+
+    def __getitem__(self, index: int) -> ViewPairSample:
+        scene = self.scenes[index % len(self.scenes)]
+        source_index = random.randrange(scene.num_frames)
+        target_index = self._sample_target_index(scene, source_index)
+
+        source = scene.build_frame_record(source_index)
+        target = scene.build_frame_record(target_index)
+        disparity_factor = torch.tensor(
+            [source.intrinsics[0, 0] / float(source.image.shape[-1])], dtype=torch.float32
+        )
+        return ViewPairSample(
+            scene_name=scene.scene_name,
+            source=source,
+            target=target,
+            disparity_factor=disparity_factor,
+        )
 
 
 def collate_view_pairs(batch: list[ViewPairSample]) -> dict[str, Any]:
     """Collate function for fine-tuning batches."""
     return {
+        "scene_name": [item.scene_name for item in batch],
         "source_image": torch.stack([item.source.image for item in batch], dim=0),
         "target_image": torch.stack([item.target.image for item in batch], dim=0),
         "source_intrinsics": torch.stack([item.source.intrinsics for item in batch], dim=0),
@@ -195,7 +305,9 @@ def collate_view_pairs(batch: list[ViewPairSample]) -> dict[str, Any]:
 
 __all__ = [
     "FrameRecord",
+    "MultiScenePosedVideoDataset",
     "PosedVideoDataset",
+    "PosedVideoScene",
     "ViewPairSample",
     "collate_view_pairs",
 ]

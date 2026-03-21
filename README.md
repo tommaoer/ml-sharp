@@ -69,7 +69,7 @@ sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
 
 ## Fine-tuning on posed videos
 
-This repository now also includes a scene fine-tuning entrypoint for a **single posed video**. The training loop follows the requested pipeline:
+This repository now also includes a scene fine-tuning entrypoint for either a **single posed video** or a **directory of many scene folders**. The training loop follows the requested pipeline:
 
 1. Randomly sample an input frame.
 2. Run the pretrained SHARP predictor to obtain Gaussians in NDC space.
@@ -78,24 +78,30 @@ This repository now also includes a scene fine-tuning entrypoint for a **single 
 5. Render the world-space Gaussians in the target camera and optimize the Gaussian Decoder.
 6. Optionally use a mask-guided refinement U-Net to predict additive Gaussian deltas for regions that are invisible from the input frame but become visible in the target frame.
 
-Expected inputs:
+Expected multi-scene input layout:
 
 ```
-/path/to/video.mp4
-/path/to/poses.json
+/path/to/data_root/
+  scene_000/
+    video.mp4
+    poses.json
+  scene_001/
+    clip.mp4
+    cameras.json
 ```
 
-The JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. A typical command is:
+Each JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. A typical multi-scene command is:
 
 ```
 sharp finetune \
-  --video-path /path/to/video.mp4 \
-  --pose-path /path/to/poses.json \
+  --data-root /path/to/data_root \
   --output-dir /path/to/output_dir \
   --checkpoint-path /path/to/sharp_2572gikvuh.pt \
   --min-frame-distance 4 \
   --max-frame-distance 48
 ```
+
+If you only want to fine-tune on one video, you can still pass `--video-path` and `--pose-path`.
 
 The command also saves intermediate visualizations for debugging, including the input frame, target frame, invisible-region mask, masked target render, and full target render. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
 

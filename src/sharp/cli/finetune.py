@@ -19,7 +19,11 @@ from torch.utils.data import DataLoader
 
 from sharp.cli.predict import DEFAULT_MODEL_URL
 from sharp.models import PredictorParams, create_predictor
-from sharp.training.dataset import PosedVideoDataset, collate_view_pairs
+from sharp.training.dataset import (
+    MultiScenePosedVideoDataset,
+    PosedVideoDataset,
+    collate_view_pairs,
+)
 from sharp.training.losses import FineTuneLoss, FineTuneLossWeights
 from sharp.training.refinement import MaskDeltaRefiner
 from sharp.utils import io, vis
@@ -32,15 +36,21 @@ LOGGER = logging.getLogger(__name__)
 
 @click.command()
 @click.option(
+    "--data-root",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help="Root path containing many scene folders, each with one mp4 and one json.",
+)
+@click.option(
     "--video-path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    required=True,
+    default=None,
     help="Path to the training video.",
 )
 @click.option(
     "--pose-path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    required=True,
+    default=None,
     help="Path to the JSON file containing fl_x/fl_y/cx/cy/c2ws.",
 )
 @click.option(
@@ -83,8 +93,9 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--depth-tv-weight", type=float, default=0.01, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def finetune_cli(
-    video_path: Path,
-    pose_path: Path,
+    data_root: Path | None,
+    video_path: Path | None,
+    pose_path: Path | None,
     output_dir: Path,
     checkpoint_path: Path | None,
     device: str,
@@ -113,6 +124,9 @@ def finetune_cli(
 ) -> None:
     """Fine-tune SHARP on a posed video sequence."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
+    if data_root is None and (video_path is None or pose_path is None):
+        raise click.UsageError("Please provide --data-root or both --video-path and --pose-path.")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     visualization_dir = output_dir / "visualizations"
     visualization_dir.mkdir(parents=True, exist_ok=True)
@@ -130,15 +144,26 @@ def finetune_cli(
     if use_invisible_refiner:
         refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
 
-    dataset = PosedVideoDataset(
-        video_path=video_path,
-        pose_path=pose_path,
-        internal_resolution=(1536, 1536),
-        min_frame_distance=min_frame_distance,
-        max_frame_distance=max_frame_distance,
-        samples_per_epoch=samples_per_epoch,
-        preload=preload_video,
-    )
+    if data_root is not None:
+        dataset = MultiScenePosedVideoDataset(
+            data_root=data_root,
+            internal_resolution=(1536, 1536),
+            min_frame_distance=min_frame_distance,
+            max_frame_distance=max_frame_distance,
+            samples_per_scene=samples_per_epoch,
+            preload=preload_video,
+        )
+    else:
+        assert video_path is not None and pose_path is not None
+        dataset = PosedVideoDataset(
+            video_path=video_path,
+            pose_path=pose_path,
+            internal_resolution=(1536, 1536),
+            min_frame_distance=min_frame_distance,
+            max_frame_distance=max_frame_distance,
+            samples_per_epoch=samples_per_epoch,
+            preload=preload_video,
+        )
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -176,8 +201,9 @@ def finetune_cli(
     write_config(
         output_dir / "finetune_config.json",
         {
-            "video_path": str(video_path),
-            "pose_path": str(pose_path),
+            "data_root": str(data_root) if data_root is not None else None,
+            "video_path": str(video_path) if video_path is not None else None,
+            "pose_path": str(pose_path) if pose_path is not None else None,
             "checkpoint_path": str(checkpoint_path) if checkpoint_path else DEFAULT_MODEL_URL,
             "batch_size": batch_size,
             "epochs": epochs,
