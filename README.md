@@ -66,6 +66,37 @@ sharp predict -i /path/to/input/images -o /path/to/output/gaussians --render
 sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
 ```
 
+
+## Fine-tuning on posed videos
+
+This repository now also includes a basic fine-tuning entrypoint that reuses the released pretrained SHARP weights and the existing model components (`monodepth -> depth alignment -> initializer -> gaussian decoder -> composer -> renderer`).
+
+Expected training data layout:
+
+```
+/path/to/data_root/
+  scene_000/
+    video.mp4
+    transforms.json
+  scene_001/
+    clip.mov
+    camera.json
+```
+
+Each JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. A typical command is:
+
+```
+sharp finetune \
+  --data-root /path/to/data_root \
+  --output-dir /path/to/output_dir \
+  --checkpoint-path /path/to/sharp_2572gikvuh.pt \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-frame-gap 24
+```
+
+The implemented loss follows the paper structure with rendering/color, alpha, perceptual, and regularization terms. If your dataset does not contain ground-truth depth, depth supervision stays disabled by default and the remaining image-space objectives are still used for fine-tuning. Since the training loop renders Gaussians with `gsplat`, fine-tuning currently requires CUDA.
+
 ## Evaluation
 
 Please refer to the paper for both quantitative and qualitative evaluations.
