@@ -22,7 +22,6 @@ class FineTuneLossWeights:
     """Weights for the fine-tuning losses."""
 
     color: float = 1.0
-    masked_color: float = 1.0
     alpha: float = 0.05
     perceptual: float = 0.1
     depth: float = 0.0
@@ -34,7 +33,6 @@ class FineTuneLossOutputs(NamedTuple):
 
     total: torch.Tensor
     color: torch.Tensor
-    masked_color: torch.Tensor
     alpha: torch.Tensor
     perceptual: torch.Tensor
     depth: torch.Tensor
@@ -78,7 +76,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 class FineTuneLoss(nn.Module):
-    """Paper-inspired fine-tuning objectives with mask-guided target supervision."""
+    """Paper-inspired fine-tuning objectives without mask refinement."""
 
     def __init__(
         self,
@@ -100,23 +98,10 @@ class FineTuneLoss(nn.Module):
         grad_y = torch.abs(inverse_depth[..., 1:, :] - inverse_depth[..., :-1, :]).mean()
         return grad_x + grad_y
 
-    @staticmethod
-    def _masked_l1(
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute an L1 loss restricted to the masked target region."""
-        weight = mask.expand_as(prediction)
-        denom = weight.sum().clamp(min=1.0)
-        return (torch.abs(prediction - target) * weight).sum() / denom
-
     def forward(
         self,
         source_render: RenderingOutputs,
         target_render: RenderingOutputs,
-        masked_target_render: RenderingOutputs,
-        invisible_mask: torch.Tensor,
         batch: dict[str, torch.Tensor | None],
         aligned_depth: torch.Tensor,
     ) -> FineTuneLossOutputs:
@@ -132,8 +117,6 @@ class FineTuneLoss(nn.Module):
             target_render.color,
             target_image,
         )
-        masked_color = self._masked_l1(masked_target_render.color, target_image, invisible_mask)
-
         alpha = F.binary_cross_entropy(
             source_render.alpha.clamp(1e-6, 1 - 1e-6),
             torch.ones_like(source_render.alpha),
@@ -155,7 +138,6 @@ class FineTuneLoss(nn.Module):
         depth_tv = self._depth_tv(aligned_depth)
         total = (
             self.weights.color * color
-            + self.weights.masked_color * masked_color
             + self.weights.alpha * alpha
             + self.weights.perceptual * perceptual
             + self.weights.depth * depth
@@ -164,7 +146,6 @@ class FineTuneLoss(nn.Module):
         return FineTuneLossOutputs(
             total=total,
             color=color,
-            masked_color=masked_color,
             alpha=alpha,
             perceptual=perceptual,
             depth=depth,

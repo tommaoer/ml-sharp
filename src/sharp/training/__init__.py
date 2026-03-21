@@ -2,7 +2,6 @@
 
 from .dataset import MultiScenePosedVideoDataset, PosedVideoDataset, collate_view_pairs
 from .losses import FineTuneLoss, FineTuneLossWeights
-from .refinement import MaskDeltaRefiner
 
 __all__ = [
     "MultiScenePosedVideoDataset",
@@ -10,5 +9,4 @@ __all__ = [
     "collate_view_pairs",
     "FineTuneLoss",
     "FineTuneLossWeights",
-    "MaskDeltaRefiner",
 ]

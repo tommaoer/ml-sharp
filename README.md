@@ -76,7 +76,6 @@ This repository now also includes a scene fine-tuning entrypoint for either a **
 3. Map these Gaussians to world space with the input-frame intrinsics/extrinsics.
 4. Randomly sample a target frame with a configurable frame-distance range.
 5. Render the world-space Gaussians in the target camera and optimize the Gaussian Decoder.
-6. Optionally use a mask-guided refinement U-Net to predict additive Gaussian deltas for regions that are invisible from the input frame but become visible in the target frame.
 
 Expected multi-scene input layout:
 
@@ -103,7 +102,7 @@ sharp finetune \
 
 If you only want to fine-tune on one video, you can still pass `--video-path` and `--pose-path`.
 
-The command also saves intermediate visualizations for debugging, including the input frame, target frame, invisible-region mask, masked target render, and full target render. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
+The command also saves intermediate visualizations for debugging, including the input frame, target frame, and target-view render. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
 
 ## Evaluation
 
