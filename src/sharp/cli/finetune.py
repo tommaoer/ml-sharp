@@ -382,6 +382,16 @@ def forward_training_pass(
         alpha=target_render.alpha,
     )
 
+    gaussian_invisible_gate = compute_gaussian_invisible_gate(
+        gaussians_world,
+        target_intrinsics,
+        target_extrinsics,
+        invisible_mask,
+        delta_values.shape[2],
+        delta_values.shape[-2],
+        delta_values.shape[-1],
+    )
+
     if refiner is not None:
         masked_color = target_render.color * invisible_mask
         refiner_size = delta_values.shape[-2:]
@@ -396,6 +406,7 @@ def forward_training_pass(
             F.interpolate(masked_color, size=refiner_size, mode="bilinear", align_corners=True),
             F.interpolate(invisible_mask, size=refiner_size, mode="nearest"),
         )
+        delta_correction = delta_correction * gaussian_invisible_gate
         refined_gaussians_ndc = predictor.gaussian_composer(
             delta=delta_values + delta_correction,
             base_values=init_output.gaussian_base_values,
@@ -422,6 +433,7 @@ def forward_training_pass(
         "masked_target_render": masked_target_render,
         "aligned_depth": aligned_depth,
         "invisible_mask": invisible_mask,
+        "gaussian_invisible_gate": gaussian_invisible_gate,
     }
 
 
@@ -432,7 +444,7 @@ def compute_target_invisible_mask(
     target_intrinsics: torch.Tensor,
     target_extrinsics: torch.Tensor,
 ) -> torch.Tensor:
-    """Project source-view visible pixels into the target view and derive an invisible mask."""
+    """Estimate target-view invisible regions with a z-buffer-style coverage test."""
     batch_size, _, height, width = source_depth.shape
     device = source_depth.device
     yy, xx = torch.meshgrid(
@@ -458,32 +470,91 @@ def compute_target_invisible_mask(
     points_target = points_world @ target_extrinsics.transpose(-1, -2)
     points_target = points_target[..., :3]
 
-    z_t = points_target[..., 2].clamp(min=1e-6)
-    u_t = target_intrinsics[:, 0, 0][:, None] * (points_target[..., 0] / z_t) + target_intrinsics[
-        :, 0, 2
-    ][:, None]
-    v_t = target_intrinsics[:, 1, 1][:, None] * (points_target[..., 1] / z_t) + target_intrinsics[
-        :, 1, 2
-    ][:, None]
+    z_t = points_target[..., 2]
+    u = target_intrinsics[:, 0, 0][:, None] * (points_target[..., 0] / z_t.clamp(min=1e-6))
+    u = u + target_intrinsics[:, 0, 2][:, None]
+    v = target_intrinsics[:, 1, 1][:, None] * (points_target[..., 1] / z_t.clamp(min=1e-6))
+    v = v + target_intrinsics[:, 1, 2][:, None]
 
-    valid = (
-        (points_target[..., 2] > 1e-4)
-        & (u_t >= 0)
-        & (u_t < width)
-        & (v_t >= 0)
-        & (v_t < height)
+    u0 = torch.floor(u)
+    v0 = torch.floor(v)
+    z_buffer = torch.full((batch_size, height * width), float("inf"), device=device)
+
+    for du, dv in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)):
+        uu = (u0 + du).long()
+        vv = (v0 + dv).long()
+        valid = (
+            (z_t > 1e-4)
+            & (uu >= 0)
+            & (uu < width)
+            & (vv >= 0)
+            & (vv < height)
+        )
+        flat_indices = vv * width + uu
+        for batch_index in range(batch_size):
+            valid_indices = flat_indices[batch_index][valid[batch_index]]
+            valid_depths = z_t[batch_index][valid[batch_index]]
+            if valid_indices.numel() > 0:
+                z_buffer[batch_index].scatter_reduce_(
+                    0,
+                    valid_indices,
+                    valid_depths,
+                    reduce="amin",
+                    include_self=True,
+                )
+
+    coverage = torch.isfinite(z_buffer).float().view(batch_size, 1, height, width)
+    coverage = F.max_pool2d(coverage, kernel_size=3, stride=1, padding=1)
+    return 1.0 - coverage
+
+
+def compute_gaussian_invisible_gate(
+    gaussians_world: Gaussians3D,
+    target_intrinsics: torch.Tensor,
+    target_extrinsics: torch.Tensor,
+    invisible_mask: torch.Tensor,
+    num_layers: int,
+    grid_height: int,
+    grid_width: int,
+) -> torch.Tensor:
+    """Gate refinement so only Gaussians projected into invisible target regions are updated."""
+    batch_size, num_gaussians, _ = gaussians_world.mean_vectors.shape
+    means_world = torch.cat(
+        [
+            gaussians_world.mean_vectors,
+            torch.ones(
+                batch_size,
+                num_gaussians,
+                1,
+                device=gaussians_world.mean_vectors.device,
+            ),
+        ],
+        dim=-1,
     )
-    u_i = u_t.round().long().clamp(0, width - 1)
-    v_i = v_t.round().long().clamp(0, height - 1)
+    means_target = means_world @ target_extrinsics.transpose(-1, -2)
+    means_target = means_target[..., :3]
 
-    coverage = torch.zeros(batch_size, height * width, device=device)
-    flat_indices = v_i * width + u_i
-    for batch_index in range(batch_size):
-        valid_indices = flat_indices[batch_index][valid[batch_index]]
-        coverage[batch_index].scatter_(0, valid_indices, 1.0)
-    coverage = coverage.view(batch_size, 1, height, width)
-    invisible = 1.0 - coverage
-    return invisible
+    z = means_target[..., 2].clamp(min=1e-6)
+    u = target_intrinsics[:, 0, 0][:, None] * (means_target[..., 0] / z)
+    u = u + target_intrinsics[:, 0, 2][:, None]
+    v = target_intrinsics[:, 1, 1][:, None] * (means_target[..., 1] / z)
+    v = v + target_intrinsics[:, 1, 2][:, None]
+
+    norm_u = 2.0 * (u / max(invisible_mask.shape[-1] - 1, 1)) - 1.0
+    norm_v = 2.0 * (v / max(invisible_mask.shape[-2] - 1, 1)) - 1.0
+    grid = torch.stack([norm_u, norm_v], dim=-1).view(batch_size, num_gaussians, 1, 2)
+    sampled_mask = F.grid_sample(
+        invisible_mask,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).view(batch_size, num_gaussians)
+
+    valid = (means_target[..., 2] > 1e-4).float()
+    sampled_mask = sampled_mask * valid
+    gate = sampled_mask.view(batch_size, num_layers, grid_height, grid_width)
+    return gate[:, None]
 
 
 def batch_unproject_gaussians(
@@ -533,9 +604,11 @@ def save_visualization_batch(
     target_render = outputs["target_render"]
     masked_target_render = outputs["masked_target_render"]
     invisible_mask = outputs["invisible_mask"]
+    gaussian_invisible_gate = outputs["gaussian_invisible_gate"]
     assert isinstance(target_render, RenderingOutputs)
     assert isinstance(masked_target_render, RenderingOutputs)
     assert isinstance(invisible_mask, torch.Tensor)
+    assert isinstance(gaussian_invisible_gate, torch.Tensor)
 
     prefix = output_dir / f"step_{global_step:06d}"
     save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.png"))
@@ -548,6 +621,10 @@ def save_visualization_batch(
     save_tensor_image(
         target_render.color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".target_render.png"),
+    )
+    save_mask_image(
+        gaussian_invisible_gate[0].mean(dim=1),
+        prefix.with_name(prefix.name + ".gaussian_gate.png"),
     )
 
 
