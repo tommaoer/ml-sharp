@@ -12,32 +12,42 @@ from pathlib import Path
 from typing import Any
 
 import click
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from sharp.cli.predict import DEFAULT_MODEL_URL
 from sharp.models import PredictorParams, create_predictor
-from sharp.training.dataset import VideoFolderSceneDataset, collate_view_pairs
+from sharp.training.dataset import PosedVideoDataset, collate_view_pairs
 from sharp.training.losses import FineTuneLoss, FineTuneLossWeights
+from sharp.training.refinement import MaskDeltaRefiner
+from sharp.utils import io, vis
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import Gaussians3D, unproject_gaussians
-from sharp.utils.gsplat import GSplatRenderer
+from sharp.utils.gsplat import GSplatRenderer, RenderingOutputs
 
 LOGGER = logging.getLogger(__name__)
 
 
 @click.command()
 @click.option(
-    "--data-root",
-    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    "--video-path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
-    help="Root folder that contains one scene per directory.",
+    help="Path to the training video.",
+)
+@click.option(
+    "--pose-path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Path to the JSON file containing fl_x/fl_y/cx/cy/c2ws.",
 )
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path, file_okay=False),
     required=True,
-    help="Directory to save checkpoints and logs.",
+    help="Directory to save checkpoints, logs, and visualizations.",
 )
 @click.option(
     "--checkpoint-path",
@@ -51,23 +61,30 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--epochs", type=int, default=1, show_default=True)
 @click.option("--lr", type=float, default=1e-5, show_default=True)
 @click.option("--weight-decay", type=float, default=1e-4, show_default=True)
-@click.option("--samples-per-scene", type=int, default=32, show_default=True)
-@click.option("--max-frame-gap", type=int, default=24, show_default=True)
-@click.option("--min-frame-distance", type=int, default=1, show_default=True)
+@click.option("--samples-per-epoch", type=int, default=256, show_default=True)
+@click.option("--min-frame-distance", type=int, default=4, show_default=True)
+@click.option("--max-frame-distance", type=int, default=48, show_default=True)
 @click.option("--log-every", type=int, default=10, show_default=True)
 @click.option("--save-every", type=int, default=200, show_default=True)
+@click.option("--visualize-every", type=int, default=50, show_default=True)
 @click.option("--max-steps", type=int, default=0, show_default=True)
 @click.option("--preload-video/--stream-video", default=False, show_default=True)
 @click.option("--perceptual/--no-perceptual", default=True, show_default=True)
 @click.option("--depth-loss/--no-depth-loss", default=False, show_default=True)
+@click.option(
+    "--use-invisible-refiner/--no-invisible-refiner",
+    default=True,
+    show_default=True,
+)
 @click.option("--color-weight", type=float, default=1.0, show_default=True)
+@click.option("--masked-color-weight", type=float, default=1.0, show_default=True)
 @click.option("--alpha-weight", type=float, default=0.05, show_default=True)
 @click.option("--perceptual-weight", type=float, default=0.1, show_default=True)
 @click.option("--depth-tv-weight", type=float, default=0.01, show_default=True)
-@click.option("--scale-reg-weight", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def finetune_cli(
-    data_root: Path,
+    video_path: Path,
+    pose_path: Path,
     output_dir: Path,
     checkpoint_path: Path | None,
     device: str,
@@ -76,25 +93,29 @@ def finetune_cli(
     epochs: int,
     lr: float,
     weight_decay: float,
-    samples_per_scene: int,
-    max_frame_gap: int,
+    samples_per_epoch: int,
     min_frame_distance: int,
+    max_frame_distance: int,
     log_every: int,
     save_every: int,
+    visualize_every: int,
     max_steps: int,
     preload_video: bool,
     perceptual: bool,
     depth_loss: bool,
+    use_invisible_refiner: bool,
     color_weight: float,
+    masked_color_weight: float,
     alpha_weight: float,
     perceptual_weight: float,
     depth_tv_weight: float,
-    scale_reg_weight: float,
     verbose: bool,
 ) -> None:
-    """Fine-tune SHARP on folder-based video scenes with camera poses."""
+    """Fine-tune SHARP on a posed video sequence."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
     output_dir.mkdir(parents=True, exist_ok=True)
+    visualization_dir = output_dir / "visualizations"
+    visualization_dir.mkdir(parents=True, exist_ok=True)
 
     device_t = resolve_device(device)
     if device_t.type != "cuda":
@@ -104,24 +125,18 @@ def finetune_cli(
         )
     LOGGER.info("Using device %s", device_t)
 
-    params = PredictorParams()
-    params.monodepth.unfreeze_decoder = True
-    params.monodepth.unfreeze_head = True
-    params.monodepth.unfreeze_image_encoder = True
-    params.depth_alignment.frozen = False
+    predictor = build_finetune_predictor(checkpoint_path).to(device_t)
+    refiner = None
+    if use_invisible_refiner:
+        refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
 
-    model = create_predictor(params)
-    state_dict = load_pretrained_weights(checkpoint_path)
-    model.load_state_dict(state_dict)
-    model.to(device_t)
-    model.train()
-
-    dataset = VideoFolderSceneDataset(
-        data_root,
+    dataset = PosedVideoDataset(
+        video_path=video_path,
+        pose_path=pose_path,
         internal_resolution=(1536, 1536),
-        samples_per_scene=samples_per_scene,
-        max_frame_gap=max_frame_gap,
         min_frame_distance=min_frame_distance,
+        max_frame_distance=max_frame_distance,
+        samples_per_epoch=samples_per_epoch,
         preload=preload_video,
     )
     loader = DataLoader(
@@ -135,44 +150,44 @@ def finetune_cli(
     )
 
     renderer = GSplatRenderer(
-        color_space=params.color_space,
+        color_space="linearRGB",
         background_color="black",
-        low_pass_filter_eps=params.low_pass_filter_eps,
+        low_pass_filter_eps=1e-2,
     ).to(device_t)
     loss_module = FineTuneLoss(
         weights=FineTuneLossWeights(
             color=color_weight,
+            masked_color=masked_color_weight,
             alpha=alpha_weight,
             perceptual=perceptual_weight,
             depth=1.0 if depth_loss else 0.0,
             depth_tv=depth_tv_weight,
-            scale_reg=scale_reg_weight,
         ),
         use_perceptual=perceptual,
     ).to(device_t)
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=lr,
-        weight_decay=weight_decay,
+
+    trainable_parameters = list(predictor.feature_model.parameters()) + list(
+        predictor.prediction_head.parameters()
     )
+    if refiner is not None:
+        trainable_parameters += list(refiner.parameters())
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     write_config(
         output_dir / "finetune_config.json",
         {
-            "data_root": str(data_root),
+            "video_path": str(video_path),
+            "pose_path": str(pose_path),
             "checkpoint_path": str(checkpoint_path) if checkpoint_path else DEFAULT_MODEL_URL,
-            "device": str(device_t),
             "batch_size": batch_size,
-            "num_workers": num_workers,
             "epochs": epochs,
             "lr": lr,
             "weight_decay": weight_decay,
-            "samples_per_scene": samples_per_scene,
-            "max_frame_gap": max_frame_gap,
+            "samples_per_epoch": samples_per_epoch,
             "min_frame_distance": min_frame_distance,
-            "preload_video": preload_video,
-            "perceptual": perceptual,
-            "depth_loss": depth_loss,
+            "max_frame_distance": max_frame_distance,
+            "use_invisible_refiner": use_invisible_refiner,
+            "visualize_every": visualize_every,
         },
     )
 
@@ -182,13 +197,14 @@ def finetune_cli(
             batch = move_batch_to_device(batch, device_t)
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = forward_training_pass(model, renderer, batch)
+            outputs = forward_training_pass(predictor, renderer, batch, refiner)
             losses = loss_module(
                 source_render=outputs["source_render"],
                 target_render=outputs["target_render"],
+                masked_target_render=outputs["masked_target_render"],
+                invisible_mask=outputs["invisible_mask"],
                 batch=batch,
                 aligned_depth=outputs["aligned_depth"],
-                alignment_map=outputs["alignment_map"],
             )
             losses.total.backward()
             optimizer.step()
@@ -197,24 +213,28 @@ def finetune_cli(
             if global_step % log_every == 0:
                 LOGGER.info(
                     (
-                        "epoch=%d step=%d total=%.4f color=%.4f alpha=%.4f "
-                        "perceptual=%.4f depth=%.4f depth_tv=%.4f scale=%.4f"
+                        "epoch=%d step=%d total=%.4f color=%.4f masked=%.4f "
+                        "alpha=%.4f perceptual=%.4f depth=%.4f depth_tv=%.4f"
                     ),
                     epoch,
                     global_step,
                     losses.total.item(),
                     losses.color.item(),
+                    losses.masked_color.item(),
                     losses.alpha.item(),
                     losses.perceptual.item(),
                     losses.depth.item(),
                     losses.depth_tv.item(),
-                    losses.scale_reg.item(),
                 )
+
+            if global_step % visualize_every == 0:
+                save_visualization_batch(visualization_dir, global_step, batch, outputs)
 
             if global_step % save_every == 0:
                 save_checkpoint(
                     output_dir / f"step_{global_step:06d}.pt",
-                    model,
+                    predictor,
+                    refiner,
                     optimizer,
                     global_step,
                 )
@@ -224,19 +244,34 @@ def finetune_cli(
         if max_steps > 0 and global_step >= max_steps:
             break
 
-    save_checkpoint(output_dir / "last.pt", model, optimizer, global_step)
+    save_checkpoint(output_dir / "last.pt", predictor, refiner, optimizer, global_step)
 
 
 def resolve_device(device: str) -> torch.device:
     """Resolve the requested device string."""
     if device == "default":
         if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(device)
+
+
+def build_finetune_predictor(checkpoint_path: Path | None):
+    """Create SHARP predictor and freeze everything except Gaussian Decoder heads."""
+    params = PredictorParams()
+    predictor = create_predictor(params)
+    predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
+    predictor.requires_grad_(False)
+    predictor.feature_model.requires_grad_(True)
+    predictor.prediction_head.requires_grad_(True)
+    predictor.train()
+    predictor.monodepth_model.eval()
+    predictor.init_model.eval()
+    predictor.gaussian_composer.eval()
+    predictor.depth_alignment.eval()
+    return predictor
 
 
 def load_pretrained_weights(checkpoint_path: Path | None) -> dict[str, Any]:
@@ -244,9 +279,10 @@ def load_pretrained_weights(checkpoint_path: Path | None) -> dict[str, Any]:
     if checkpoint_path is None:
         LOGGER.info("Downloading pretrained checkpoint from %s", DEFAULT_MODEL_URL)
         return torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
-
     LOGGER.info("Loading pretrained checkpoint from %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if isinstance(checkpoint, dict) and "predictor" in checkpoint:
+        return checkpoint["predictor"]
     if isinstance(checkpoint, dict) and "model" in checkpoint:
         return checkpoint["model"]
     return checkpoint
@@ -269,14 +305,15 @@ def move_batch_to_device(
 
 
 def forward_training_pass(
-    model,
+    predictor,
     renderer: GSplatRenderer,
     batch: dict[str, torch.Tensor | None],
-) -> dict[str, torch.Tensor | Gaussians3D | Any]:
-    """Run the paper-style training forward pass."""
+    refiner: MaskDeltaRefiner | None,
+) -> dict[str, torch.Tensor | RenderingOutputs | Gaussians3D]:
+    """Run input-frame -> NDC Gaussians -> world-space -> target rendering."""
     source_image = batch["source_image"]
-    disparity_factor = batch["disparity_factor"]
     source_depth = batch["source_depth"]
+    disparity_factor = batch["disparity_factor"]
     source_intrinsics = batch["source_intrinsics"]
     source_extrinsics = batch["source_extrinsics"]
     target_intrinsics = batch["target_intrinsics"]
@@ -289,22 +326,22 @@ def forward_training_pass(
     assert isinstance(target_intrinsics, torch.Tensor)
     assert isinstance(target_extrinsics, torch.Tensor)
 
-    monodepth_output = model.monodepth_model(source_image)
+    monodepth_output = predictor.monodepth_model(source_image)
     predicted_disparity = monodepth_output.disparity
     metric_depth = disparity_factor[:, :, None, None] / predicted_disparity.clamp(min=1e-4)
-
-    aligned_depth, alignment_map = model.depth_alignment(
+    aligned_depth, _ = predictor.depth_alignment(
         metric_depth,
         source_depth,
         monodepth_output.decoder_features,
     )
-    init_output = model.init_model(source_image, aligned_depth)
-    image_features = model.feature_model(
+
+    init_output = predictor.init_model(source_image, aligned_depth)
+    image_features = predictor.feature_model(
         init_output.feature_input,
         encodings=monodepth_output.output_features,
     )
-    delta_values = model.prediction_head(image_features)
-    gaussians_ndc = model.gaussian_composer(
+    delta_values = predictor.prediction_head(image_features)
+    gaussians_ndc = predictor.gaussian_composer(
         delta=delta_values,
         base_values=init_output.gaussian_base_values,
         global_scale=init_output.global_scale,
@@ -332,14 +369,121 @@ def forward_training_pass(
         image_height=source_image.shape[-2],
     )
 
+    invisible_mask = compute_target_invisible_mask(
+        aligned_depth[:, 0:1],
+        source_intrinsics,
+        source_extrinsics,
+        target_intrinsics,
+        target_extrinsics,
+    )
+    masked_target_render = RenderingOutputs(
+        color=target_render.color,
+        depth=target_render.depth,
+        alpha=target_render.alpha,
+    )
+
+    if refiner is not None:
+        masked_color = target_render.color * invisible_mask
+        refiner_size = delta_values.shape[-2:]
+        delta_correction = refiner(
+            F.interpolate(source_image, size=refiner_size, mode="bilinear", align_corners=True),
+            F.interpolate(
+                target_render.color,
+                size=refiner_size,
+                mode="bilinear",
+                align_corners=True,
+            ),
+            F.interpolate(masked_color, size=refiner_size, mode="bilinear", align_corners=True),
+            F.interpolate(invisible_mask, size=refiner_size, mode="nearest"),
+        )
+        refined_gaussians_ndc = predictor.gaussian_composer(
+            delta=delta_values + delta_correction,
+            base_values=init_output.gaussian_base_values,
+            global_scale=init_output.global_scale,
+        )
+        refined_gaussians_world = batch_unproject_gaussians(
+            refined_gaussians_ndc,
+            source_extrinsics,
+            source_intrinsics,
+            image_shape,
+        )
+        masked_target_render = renderer(
+            refined_gaussians_world,
+            target_extrinsics,
+            target_intrinsics,
+            image_width=source_image.shape[-1],
+            image_height=source_image.shape[-2],
+        )
+
     return {
-        "gaussians_ndc": gaussians_ndc,
         "gaussians_world": gaussians_world,
         "source_render": source_render,
         "target_render": target_render,
+        "masked_target_render": masked_target_render,
         "aligned_depth": aligned_depth,
-        "alignment_map": alignment_map,
+        "invisible_mask": invisible_mask,
     }
+
+
+def compute_target_invisible_mask(
+    source_depth: torch.Tensor,
+    source_intrinsics: torch.Tensor,
+    source_extrinsics: torch.Tensor,
+    target_intrinsics: torch.Tensor,
+    target_extrinsics: torch.Tensor,
+) -> torch.Tensor:
+    """Project source-view visible pixels into the target view and derive an invisible mask."""
+    batch_size, _, height, width = source_depth.shape
+    device = source_depth.device
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device, dtype=torch.float32),
+        torch.arange(width, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    xx = xx[None].expand(batch_size, -1, -1)
+    yy = yy[None].expand(batch_size, -1, -1)
+    z = source_depth[:, 0]
+
+    fx = source_intrinsics[:, 0, 0][:, None, None]
+    fy = source_intrinsics[:, 1, 1][:, None, None]
+    cx = source_intrinsics[:, 0, 2][:, None, None]
+    cy = source_intrinsics[:, 1, 2][:, None, None]
+
+    x = (xx - cx) / fx * z
+    y = (yy - cy) / fy * z
+    points_cam = torch.stack([x, y, z, torch.ones_like(z)], dim=-1)
+
+    source_c2w = torch.linalg.inv(source_extrinsics)
+    points_world = points_cam.reshape(batch_size, -1, 4) @ source_c2w.transpose(-1, -2)
+    points_target = points_world @ target_extrinsics.transpose(-1, -2)
+    points_target = points_target[..., :3]
+
+    z_t = points_target[..., 2].clamp(min=1e-6)
+    u_t = target_intrinsics[:, 0, 0][:, None] * (points_target[..., 0] / z_t) + target_intrinsics[
+        :, 0, 2
+    ][:, None]
+    v_t = target_intrinsics[:, 1, 1][:, None] * (points_target[..., 1] / z_t) + target_intrinsics[
+        :, 1, 2
+    ][:, None]
+
+    valid = (
+        (points_target[..., 2] > 1e-4)
+        & (u_t >= 0)
+        & (u_t < width)
+        & (v_t >= 0)
+        & (v_t < height)
+    )
+    u_i = u_t.round().long().clamp(0, width - 1)
+    v_i = v_t.round().long().clamp(0, height - 1)
+
+    coverage = torch.zeros(batch_size, height * width, device=device)
+    flat_indices = v_i * width + u_i
+    for batch_index in range(batch_size):
+        valid_indices = flat_indices[batch_index][valid[batch_index]]
+        coverage[batch_index].scatter_(0, valid_indices, 1.0)
+    coverage = coverage.view(batch_size, 1, height, width)
+    invisible = 1.0 - coverage
+    return invisible
 
 
 def batch_unproject_gaussians(
@@ -374,9 +518,55 @@ def batch_unproject_gaussians(
     )
 
 
+def save_visualization_batch(
+    output_dir: Path,
+    global_step: int,
+    batch: dict[str, torch.Tensor | None],
+    outputs: dict[str, torch.Tensor | RenderingOutputs | Gaussians3D],
+) -> None:
+    """Save intermediate visualizations for debugging."""
+    source_image = batch["source_image"]
+    target_image = batch["target_image"]
+    assert isinstance(source_image, torch.Tensor)
+    assert isinstance(target_image, torch.Tensor)
+
+    target_render = outputs["target_render"]
+    masked_target_render = outputs["masked_target_render"]
+    invisible_mask = outputs["invisible_mask"]
+    assert isinstance(target_render, RenderingOutputs)
+    assert isinstance(masked_target_render, RenderingOutputs)
+    assert isinstance(invisible_mask, torch.Tensor)
+
+    prefix = output_dir / f"step_{global_step:06d}"
+    save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.png"))
+    save_tensor_image(target_image[0], prefix.with_name(prefix.name + ".target.png"))
+    save_mask_image(invisible_mask[0], prefix.with_name(prefix.name + ".mask.png"))
+    save_tensor_image(
+        (masked_target_render.color[0] * invisible_mask[0]).clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".masked_render.png"),
+    )
+    save_tensor_image(
+        target_render.color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".target_render.png"),
+    )
+
+
+def save_tensor_image(tensor: torch.Tensor, path: Path) -> None:
+    """Save a float tensor image in CHW format to disk."""
+    image = tensor.detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy()
+    io.save_image((image * 255.0).astype(np.uint8), path)
+
+
+def save_mask_image(mask: torch.Tensor, path: Path) -> None:
+    """Save a mask visualization."""
+    colorized = vis.colorize_alpha(mask.detach().cpu())[None][0].permute(1, 2, 0).numpy()
+    io.save_image(colorized.astype(np.uint8), path)
+
+
 def save_checkpoint(
     path: Path,
-    model,
+    predictor,
+    refiner: MaskDeltaRefiner | None,
     optimizer: torch.optim.Optimizer,
     global_step: int,
 ) -> None:
@@ -384,7 +574,8 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model": model.state_dict(),
+            "predictor": predictor.state_dict(),
+            "refiner": refiner.state_dict() if refiner is not None else None,
             "optimizer": optimizer.state_dict(),
             "global_step": global_step,
         },

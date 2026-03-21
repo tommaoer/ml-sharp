@@ -69,33 +69,35 @@ sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
 
 ## Fine-tuning on posed videos
 
-This repository now also includes a basic fine-tuning entrypoint that reuses the released pretrained SHARP weights and the existing model components (`monodepth -> depth alignment -> initializer -> gaussian decoder -> composer -> renderer`).
+This repository now also includes a scene fine-tuning entrypoint for a **single posed video**. The training loop follows the requested pipeline:
 
-Expected training data layout:
+1. Randomly sample an input frame.
+2. Run the pretrained SHARP predictor to obtain Gaussians in NDC space.
+3. Map these Gaussians to world space with the input-frame intrinsics/extrinsics.
+4. Randomly sample a target frame with a configurable frame-distance range.
+5. Render the world-space Gaussians in the target camera and optimize the Gaussian Decoder.
+6. Optionally use a mask-guided refinement U-Net to predict additive Gaussian deltas for regions that are invisible from the input frame but become visible in the target frame.
+
+Expected inputs:
 
 ```
-/path/to/data_root/
-  scene_000/
-    video.mp4
-    transforms.json
-  scene_001/
-    clip.mov
-    camera.json
+/path/to/video.mp4
+/path/to/poses.json
 ```
 
-Each JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. A typical command is:
+The JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. A typical command is:
 
 ```
 sharp finetune \
-  --data-root /path/to/data_root \
+  --video-path /path/to/video.mp4 \
+  --pose-path /path/to/poses.json \
   --output-dir /path/to/output_dir \
   --checkpoint-path /path/to/sharp_2572gikvuh.pt \
-  --epochs 1 \
-  --batch-size 1 \
-  --max-frame-gap 24
+  --min-frame-distance 4 \
+  --max-frame-distance 48
 ```
 
-The implemented loss follows the paper structure with rendering/color, alpha, perceptual, and regularization terms. If your dataset does not contain ground-truth depth, depth supervision stays disabled by default and the remaining image-space objectives are still used for fine-tuning. Since the training loop renders Gaussians with `gsplat`, fine-tuning currently requires CUDA.
+The command also saves intermediate visualizations for debugging, including the input frame, target frame, invisible-region mask, masked target render, and full target render. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
 
 ## Evaluation
 
