@@ -42,10 +42,15 @@ class MaskDeltaRefiner(nn.Module):
         )
         encoded = self.encoder(features)
         delta = self.conv_out(self.decoder(encoded))
-        batch_size, _, height, width = delta.shape
+        _, _, height, width = delta.shape
         delta = delta.unflatten(1, (14, self.num_layers))
-        mask = invisible_mask[:, None]
-        mask = torch.nn.functional.interpolate(mask, size=(height, width), mode="nearest")
+        # `invisible_mask` is already BCHW here; keep it 4D for interpolate and only
+        # expand to 5D afterwards to match [B, 14, L, H, W] delta tensors.
+        mask = torch.nn.functional.interpolate(
+            invisible_mask,
+            size=(height, width),
+            mode="nearest",
+        )
         return delta * mask[:, None]
 
 
