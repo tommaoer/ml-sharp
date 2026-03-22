@@ -178,9 +178,21 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_parameters = list(predictor.feature_model.parameters()) + list(
-        predictor.prediction_head.parameters()
+    trainable_module_names = ["feature_model", "prediction_head"]
+    trainable_parameter_names = [
+        name for name, param in predictor.named_parameters() if param.requires_grad
+    ]
+    trainable_parameter_count = sum(
+        param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     )
+    LOGGER.info(
+        "Optimizing predictor modules: %s (%d parameters)",
+        ", ".join(trainable_module_names),
+        trainable_parameter_count,
+    )
+    trainable_parameters = [
+        param for _, param in predictor.named_parameters() if param.requires_grad
+    ]
     optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     write_config(
@@ -199,6 +211,9 @@ def finetune_cli(
             "max_frame_distance": max_frame_distance,
             "visualize_every": visualize_every,
             "low_pass_filter_eps": low_pass_filter_eps,
+            "trainable_modules": trainable_module_names,
+            "trainable_parameter_count": trainable_parameter_count,
+            "trainable_parameter_names": trainable_parameter_names,
         },
     )
 
@@ -215,6 +230,11 @@ def finetune_cli(
                 batch=batch,
                 aligned_depth=outputs["aligned_depth"],
             )
+
+            if global_step == 0:
+                LOGGER.info("Saving pre-optimization visualization at step=0")
+                save_visualization_batch(visualization_dir, global_step, batch, outputs)
+
             losses.total.backward()
             optimizer.step()
 
