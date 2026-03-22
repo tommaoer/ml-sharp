@@ -178,22 +178,15 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names = ["feature_model", "prediction_head"]
+    trainable_module_names: list[str] = []
     trainable_parameter_names = [
         name for name, param in predictor.named_parameters() if param.requires_grad
     ]
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     )
-    LOGGER.info(
-        "Optimizing predictor modules: %s (%d parameters)",
-        ", ".join(trainable_module_names),
-        trainable_parameter_count,
-    )
-    trainable_parameters = [
-        param for _, param in predictor.named_parameters() if param.requires_grad
-    ]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
+    LOGGER.info("All predictor modules are frozen; no parameters will be optimized.")
+    optimizer = None
 
     write_config(
         output_dir / "finetune_config.json",
@@ -221,7 +214,6 @@ def finetune_cli(
     for epoch in range(epochs):
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
-            optimizer.zero_grad(set_to_none=True)
 
             outputs = forward_training_pass(predictor, renderer, batch)
             losses = loss_module(
@@ -235,8 +227,7 @@ def finetune_cli(
                 LOGGER.info("Saving visualization at epoch=0 step=0 before optimization")
                 save_visualization_batch(visualization_dir, global_step, batch, outputs)
 
-            losses.total.backward()
-            optimizer.step()
+            # Intentionally skip backward/optimizer updates: all networks are frozen.
 
             global_step += 1
             if global_step % log_every == 0:
@@ -286,13 +277,11 @@ def resolve_device(device: str) -> torch.device:
 
 
 def build_finetune_predictor(checkpoint_path: Path | None):
-    """Create SHARP predictor and freeze everything except decoder modules."""
+    """Create SHARP predictor with all modules frozen."""
     params = PredictorParams()
     predictor = create_predictor(params)
     predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
     predictor.requires_grad_(False)
-    predictor.feature_model.requires_grad_(True)
-    predictor.prediction_head.requires_grad_(True)
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
@@ -601,7 +590,7 @@ def save_tensor_image(tensor: torch.Tensor, path: Path) -> None:
 def save_checkpoint(
     path: Path,
     predictor,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     global_step: int,
 ) -> None:
     """Save a training checkpoint."""
@@ -609,7 +598,7 @@ def save_checkpoint(
     torch.save(
         {
             "predictor": predictor.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "global_step": global_step,
         },
         path,
