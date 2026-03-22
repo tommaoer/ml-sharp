@@ -102,7 +102,7 @@ sharp finetune \
 
 If you only want to fine-tune on one video, you can still pass `--video-path` and `--pose-path`.
 
-The command also saves intermediate visualizations for debugging, including the input frame, target frame, and target-view render. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
+The command keeps the network input at `1536x1536`, but it also preserves each frame's original resolution for debugging renders. Saved visualizations now include the resized training images, original-resolution input/target frames, the input-view Gaussian render, and the target-view Gaussian render so you can directly check whether mismatches come from pose/calibration or Gaussian quality. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
 
 ## Evaluation
 

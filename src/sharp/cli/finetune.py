@@ -318,15 +318,23 @@ def forward_training_pass(
     source_depth = batch["source_depth"]
     disparity_factor = batch["disparity_factor"]
     source_intrinsics = batch["source_intrinsics"]
+    source_original_intrinsics = batch["source_original_intrinsics"]
+    source_original_size = batch["source_original_size"]
     source_extrinsics = batch["source_extrinsics"]
     target_intrinsics = batch["target_intrinsics"]
+    target_original_intrinsics = batch["target_original_intrinsics"]
+    target_original_size = batch["target_original_size"]
     target_extrinsics = batch["target_extrinsics"]
 
     assert isinstance(source_image, torch.Tensor)
     assert isinstance(disparity_factor, torch.Tensor)
     assert isinstance(source_intrinsics, torch.Tensor)
+    assert isinstance(source_original_intrinsics, torch.Tensor)
+    assert isinstance(source_original_size, torch.Tensor)
     assert isinstance(source_extrinsics, torch.Tensor)
     assert isinstance(target_intrinsics, torch.Tensor)
+    assert isinstance(target_original_intrinsics, torch.Tensor)
+    assert isinstance(target_original_size, torch.Tensor)
     assert isinstance(target_extrinsics, torch.Tensor)
 
     monodepth_output = predictor.monodepth_model(source_image)
@@ -371,14 +379,58 @@ def forward_training_pass(
         image_width=source_image.shape[-1],
         image_height=source_image.shape[-2],
     )
+    source_render_original = render_batch_at_sizes(
+        renderer,
+        gaussians_world,
+        source_extrinsics,
+        source_original_intrinsics,
+        source_original_size,
+    )
+    target_render_original = render_batch_at_sizes(
+        renderer,
+        gaussians_world,
+        target_extrinsics,
+        target_original_intrinsics,
+        target_original_size,
+    )
 
     return {
         "gaussians_world": gaussians_world,
         "source_render": source_render,
         "target_render": target_render,
+        "source_render_original": source_render_original,
+        "target_render_original": target_render_original,
         "aligned_depth": aligned_depth,
     }
 
+
+
+def render_batch_at_sizes(
+    renderer: GSplatRenderer,
+    gaussians_world: Gaussians3D,
+    extrinsics: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_sizes: torch.Tensor,
+) -> list[RenderingOutputs]:
+    """Render each batch item at its requested image size."""
+    renders = []
+    for index in range(gaussians_world.mean_vectors.shape[0]):
+        renders.append(
+            renderer(
+                Gaussians3D(
+                    mean_vectors=gaussians_world.mean_vectors[index : index + 1],
+                    singular_values=gaussians_world.singular_values[index : index + 1],
+                    quaternions=gaussians_world.quaternions[index : index + 1],
+                    colors=gaussians_world.colors[index : index + 1],
+                    opacities=gaussians_world.opacities[index : index + 1],
+                ),
+                extrinsics[index : index + 1],
+                intrinsics[index : index + 1],
+                image_width=int(image_sizes[index, 1].item()),
+                image_height=int(image_sizes[index, 0].item()),
+            )
+        )
+    return renders
 
 
 
@@ -423,17 +475,41 @@ def save_visualization_batch(
     """Save intermediate visualizations for debugging."""
     source_image = batch["source_image"]
     target_image = batch["target_image"]
+    source_original_image = batch["source_original_image"]
+    target_original_image = batch["target_original_image"]
     assert isinstance(source_image, torch.Tensor)
     assert isinstance(target_image, torch.Tensor)
+    assert isinstance(source_original_image, list)
+    assert isinstance(target_original_image, list)
 
+    source_render = outputs["source_render"]
     target_render = outputs["target_render"]
+    source_render_original = outputs["source_render_original"]
+    target_render_original = outputs["target_render_original"]
+    assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
+    assert isinstance(source_render_original, list)
+    assert isinstance(target_render_original, list)
 
     prefix = output_dir / f"step_{global_step:06d}"
-    save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.png"))
-    save_tensor_image(target_image[0], prefix.with_name(prefix.name + ".target.png"))
+    save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.train.png"))
+    save_tensor_image(target_image[0], prefix.with_name(prefix.name + ".target.train.png"))
+    save_tensor_image(source_original_image[0], prefix.with_name(prefix.name + ".source.png"))
+    save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
+    save_tensor_image(
+        source_render.color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".source_render.train.png"),
+    )
     save_tensor_image(
         target_render.color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".target_render.train.png"),
+    )
+    save_tensor_image(
+        source_render_original[0].color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".source_render.png"),
+    )
+    save_tensor_image(
+        target_render_original[0].color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".target_render.png"),
     )
 

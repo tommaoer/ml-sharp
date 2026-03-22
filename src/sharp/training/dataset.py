@@ -25,6 +25,8 @@ class FrameRecord:
 
     image: torch.Tensor
     intrinsics: torch.Tensor
+    original_image: torch.Tensor
+    original_intrinsics: torch.Tensor
     extrinsics: torch.Tensor
     frame_index: int
     depth: torch.Tensor | None = None
@@ -120,12 +122,12 @@ class PosedVideoScene:
         return scaled
 
     def build_frame_record(self, frame_index: int) -> FrameRecord:
-        """Build one frame record with resized image and scaled intrinsics."""
-        image = self.load_frame(frame_index)
-        _, height, width = image.shape
+        """Build one frame record with both training and original-resolution views."""
+        original_image = self.load_frame(frame_index)
+        _, height, width = original_image.shape
         target_height, target_width = self.internal_resolution
         image = F.interpolate(
-            image[None],
+            original_image[None],
             size=(target_height, target_width),
             mode="bilinear",
             align_corners=True,
@@ -140,6 +142,8 @@ class PosedVideoScene:
         return FrameRecord(
             image=image,
             intrinsics=intrinsics,
+            original_image=original_image,
+            original_intrinsics=self.intrinsics.clone(),
             extrinsics=torch.linalg.inv(self.c2ws[frame_index]),
             frame_index=frame_index,
         )
@@ -291,8 +295,16 @@ def collate_view_pairs(batch: list[ViewPairSample]) -> dict[str, Any]:
         "scene_name": [item.scene_name for item in batch],
         "source_image": torch.stack([item.source.image for item in batch], dim=0),
         "target_image": torch.stack([item.target.image for item in batch], dim=0),
+        "source_original_image": [item.source.original_image for item in batch],
+        "target_original_image": [item.target.original_image for item in batch],
         "source_intrinsics": torch.stack([item.source.intrinsics for item in batch], dim=0),
         "target_intrinsics": torch.stack([item.target.intrinsics for item in batch], dim=0),
+        "source_original_intrinsics": torch.stack(
+            [item.source.original_intrinsics for item in batch], dim=0
+        ),
+        "target_original_intrinsics": torch.stack(
+            [item.target.original_intrinsics for item in batch], dim=0
+        ),
         "source_extrinsics": torch.stack([item.source.extrinsics for item in batch], dim=0),
         "target_extrinsics": torch.stack([item.target.extrinsics for item in batch], dim=0),
         "source_depth": None,
@@ -300,6 +312,12 @@ def collate_view_pairs(batch: list[ViewPairSample]) -> dict[str, Any]:
         "disparity_factor": torch.stack([item.disparity_factor for item in batch], dim=0),
         "source_frame_index": torch.tensor([item.source.frame_index for item in batch]),
         "target_frame_index": torch.tensor([item.target.frame_index for item in batch]),
+        "source_original_size": torch.tensor(
+            [[item.source.original_image.shape[-2], item.source.original_image.shape[-1]] for item in batch]
+        ),
+        "target_original_size": torch.tensor(
+            [[item.target.original_image.shape[-2], item.target.original_image.shape[-1]] for item in batch]
+        ),
     }
 
 
