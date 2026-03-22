@@ -178,7 +178,7 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names = ["feature_model", "prediction_head"]
+    trainable_module_names = ["feature_model"]
     trainable_parameter_names = [
         name for name, param in predictor.named_parameters() if param.requires_grad
     ]
@@ -218,6 +218,16 @@ def finetune_cli(
     )
 
     global_step = 0
+    try:
+        initial_batch = move_batch_to_device(next(iter(loader)), device_t)
+    except StopIteration as exc:
+        raise RuntimeError("Fine-tuning dataset is empty.") from exc
+
+    LOGGER.info("Saving pre-training visualization before the first optimizer step")
+    with torch.no_grad():
+        initial_outputs = forward_training_pass(predictor, renderer, initial_batch)
+    save_visualization_batch(visualization_dir, global_step, initial_batch, initial_outputs)
+
     for epoch in range(epochs):
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
@@ -230,10 +240,6 @@ def finetune_cli(
                 batch=batch,
                 aligned_depth=outputs["aligned_depth"],
             )
-
-            if global_step == 0:
-                LOGGER.info("Saving pre-optimization visualization at step=0")
-                save_visualization_batch(visualization_dir, global_step, batch, outputs)
 
             losses.total.backward()
             optimizer.step()
@@ -286,13 +292,13 @@ def resolve_device(device: str) -> torch.device:
 
 
 def build_finetune_predictor(checkpoint_path: Path | None):
-    """Create SHARP predictor and freeze everything except Gaussian Decoder heads."""
+    """Create SHARP predictor and freeze everything except the feature model."""
     params = PredictorParams()
     predictor = create_predictor(params)
     predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
     predictor.requires_grad_(False)
     predictor.feature_model.requires_grad_(True)
-    predictor.prediction_head.requires_grad_(True)
+    predictor.prediction_head.requires_grad_(False)
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
