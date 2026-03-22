@@ -102,7 +102,7 @@ sharp finetune \
 
 If you only want to fine-tune on one video, you can still pass `--video-path` and `--pose-path`.
 
-The command keeps the network input at `1536x1536`, but it also preserves each frame's original resolution for debugging renders. Saved visualizations now include the resized training images, original-resolution input/target frames, the input-view Gaussian render, and the target-view Gaussian render so you can directly check whether mismatches come from pose/calibration or Gaussian quality. By default, fine-tuning uses `--low-pass-filter-eps 0.0` so the debug renders match the standard SHARP render path instead of adding extra smoothing. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
+The command keeps the network input at `1536x1536`, but it also preserves each frame's original resolution for debugging renders. Saved visualizations now include the resized training images, original-resolution input/target frames, a direct source-camera Gaussian render (`source_render_camera*`), the source-view world-roundtrip Gaussian render (`source_render*`), the target-view Gaussian render, and a small `source_render_metrics.txt` file so you can tell whether blur is already present in the model's source-camera reconstruction or is introduced by the source→world→source transform. By default, fine-tuning uses `--low-pass-filter-eps 0.0` so the debug renders match the standard SHARP render path instead of adding extra smoothing. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
 
 ## Evaluation
 

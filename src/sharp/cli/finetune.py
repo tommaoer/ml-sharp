@@ -362,11 +362,26 @@ def forward_training_pass(
     )
 
     image_shape = (source_image.shape[-1], source_image.shape[-2])
+    identity_extrinsics = torch.eye(4, device=source_image.device, dtype=source_image.dtype)[None]
+    identity_extrinsics = identity_extrinsics.repeat(source_image.shape[0], 1, 1)
+    gaussians_camera = batch_unproject_gaussians(
+        gaussians_ndc,
+        identity_extrinsics,
+        source_intrinsics,
+        image_shape,
+    )
     gaussians_world = batch_unproject_gaussians(
         gaussians_ndc,
         source_extrinsics,
         source_intrinsics,
         image_shape,
+    )
+    source_camera_render = renderer(
+        gaussians_camera,
+        identity_extrinsics,
+        source_intrinsics,
+        image_width=source_image.shape[-1],
+        image_height=source_image.shape[-2],
     )
     source_render = renderer(
         gaussians_world,
@@ -381,6 +396,13 @@ def forward_training_pass(
         target_intrinsics,
         image_width=source_image.shape[-1],
         image_height=source_image.shape[-2],
+    )
+    source_camera_render_original = render_batch_at_sizes(
+        renderer,
+        gaussians_camera,
+        identity_extrinsics,
+        source_original_intrinsics,
+        source_original_size,
     )
     source_render_original = render_batch_at_sizes(
         renderer,
@@ -398,9 +420,12 @@ def forward_training_pass(
     )
 
     return {
+        "gaussians_camera": gaussians_camera,
         "gaussians_world": gaussians_world,
+        "source_camera_render": source_camera_render,
         "source_render": source_render,
         "target_render": target_render,
+        "source_camera_render_original": source_camera_render_original,
         "source_render_original": source_render_original,
         "target_render_original": target_render_original,
         "aligned_depth": aligned_depth,
@@ -485,12 +510,16 @@ def save_visualization_batch(
     assert isinstance(source_original_image, list)
     assert isinstance(target_original_image, list)
 
+    source_camera_render = outputs["source_camera_render"]
     source_render = outputs["source_render"]
     target_render = outputs["target_render"]
+    source_camera_render_original = outputs["source_camera_render_original"]
     source_render_original = outputs["source_render_original"]
     target_render_original = outputs["target_render_original"]
+    assert isinstance(source_camera_render, RenderingOutputs)
     assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
+    assert isinstance(source_camera_render_original, list)
     assert isinstance(source_render_original, list)
     assert isinstance(target_render_original, list)
 
@@ -500,12 +529,20 @@ def save_visualization_batch(
     save_tensor_image(source_original_image[0], prefix.with_name(prefix.name + ".source.png"))
     save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
     save_tensor_image(
+        source_camera_render.color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".source_render_camera.train.png"),
+    )
+    save_tensor_image(
         source_render.color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".source_render.train.png"),
     )
     save_tensor_image(
         target_render.color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".target_render.train.png"),
+    )
+    save_tensor_image(
+        source_camera_render_original[0].color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".source_render_camera.png"),
     )
     save_tensor_image(
         source_render_original[0].color[0].clamp(0.0, 1.0),
@@ -515,6 +552,23 @@ def save_visualization_batch(
         target_render_original[0].color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".target_render.png"),
     )
+
+    if isinstance(source_image, torch.Tensor):
+        camera_l1 = (source_camera_render.color[0] - source_image[0]).abs().mean().item()
+        world_l1 = (source_render.color[0] - source_image[0]).abs().mean().item()
+        delta_l1 = (source_render.color[0] - source_camera_render.color[0]).abs().mean().item()
+        metrics_path = prefix.with_name(prefix.name + ".source_render_metrics.txt")
+        metrics_path.write_text(
+            "\n".join(
+                [
+                    f"source_camera_render_l1={camera_l1:.8f}",
+                    f"source_world_render_l1={world_l1:.8f}",
+                    f"source_world_vs_camera_l1={delta_l1:.8f}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 def save_tensor_image(tensor: torch.Tensor, path: Path) -> None:
