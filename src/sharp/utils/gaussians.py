@@ -98,7 +98,7 @@ def unproject_gaussians(
     return gaussians
 
 
-def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+def apply_transform1(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
     Args:
@@ -130,6 +130,38 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
         opacities=gaussians.opacities,
     )
 
+
+def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+    """Apply an affine transformation to 3D Gaussians.
+
+    Args:
+        gaussians: The Gaussians to transform.
+        transform: An affine transform with shape 3x4.
+
+    Returns:
+        The transformed Gaussians.
+
+    Note: This operation is not differentiable.
+    """
+    transform_linear = transform[..., :3, :3]
+    transform_offset = transform[..., :3, 3]
+
+    mean_vectors = gaussians.mean_vectors @ transform_linear.transpose(-1, -2) + transform_offset
+    covariance_matrices = compose_covariance_matrices(
+        gaussians.quaternions, gaussians.singular_values
+    )
+    covariance_matrices = (
+        transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
+    )
+    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+
+    return Gaussians3D(
+        mean_vectors=mean_vectors,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities,
+    )
 
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,
