@@ -84,7 +84,12 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--color-weight", type=float, default=1.0, show_default=True)
 @click.option("--alpha-weight", type=float, default=0.05, show_default=True)
 @click.option("--perceptual-weight", type=float, default=0.1, show_default=True)
-@click.option("--depth-tv-weight", type=float, default=0.01, show_default=True)
+@click.option("--depth-tv-weight", type=float, default=0.0, show_default=True)
+@click.option("--grad-weight", type=float, default=0.0, show_default=True)
+@click.option("--delta-weight", type=float, default=0.0, show_default=True)
+@click.option("--splat-weight", type=float, default=0.0, show_default=True)
+@click.option("--scale-weight", type=float, default=0.0, show_default=True)
+@click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def finetune_cli(
@@ -113,6 +118,11 @@ def finetune_cli(
     alpha_weight: float,
     perceptual_weight: float,
     depth_tv_weight: float,
+    grad_weight: float,
+    delta_weight: float,
+    splat_weight: float,
+    scale_weight: float,
+    scale_tv_weight: float,
     low_pass_filter_eps: float,
     verbose: bool,
 ) -> None:
@@ -177,6 +187,11 @@ def finetune_cli(
             perceptual=perceptual_weight,
             depth=1.0 if depth_loss else 0.0,
             depth_tv=depth_tv_weight,
+            grad=grad_weight,
+            delta=delta_weight,
+            splat=splat_weight,
+            scale=scale_weight,
+            scale_tv=scale_tv_weight,
         ),
         use_perceptual=perceptual,
     ).to(device_t)
@@ -216,6 +231,11 @@ def finetune_cli(
             "max_frame_distance": max_frame_distance,
             "visualize_every": visualize_every,
             "low_pass_filter_eps": low_pass_filter_eps,
+            "grad_weight": grad_weight,
+            "delta_weight": delta_weight,
+            "splat_weight": splat_weight,
+            "scale_weight": scale_weight,
+            "scale_tv_weight": scale_tv_weight,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
             "trainable_parameter_names": trainable_parameter_names,
@@ -234,6 +254,10 @@ def finetune_cli(
                 target_render=outputs["refined_target_render"],
                 batch=batch,
                 aligned_depth=outputs["aligned_depth"],
+                delta_values=outputs["delta_values"],
+                gaussians_ndc=outputs["gaussians_ndc"],
+                gaussians_world=outputs["gaussians_world"],
+                depth_alignment_map=outputs["depth_alignment_map"],
             )
 
             if epoch == 0 and global_step == 0:
@@ -247,8 +271,9 @@ def finetune_cli(
             if global_step % log_every == 0:
                 LOGGER.info(
                     (
-                        "epoch=%d step=%d total=%.4f color=%.4f "
-                        "alpha=%.4f perceptual=%.4f depth=%.4f depth_tv=%.4f"
+                        "epoch=%d step=%d total=%.4f color=%.4f alpha=%.4f "
+                        "perceptual=%.4f depth=%.4f depth_tv=%.4f grad=%.4f "
+                        "delta=%.4f splat=%.4f scale=%.4f scale_tv=%.4f"
                     ),
                     epoch,
                     global_step,
@@ -258,6 +283,11 @@ def finetune_cli(
                     losses.perceptual.item(),
                     losses.depth.item(),
                     losses.depth_tv.item(),
+                    losses.grad.item(),
+                    losses.delta.item(),
+                    losses.splat.item(),
+                    losses.scale.item(),
+                    losses.scale_tv.item(),
                 )
 
             if global_step % visualize_every == 0:
@@ -370,7 +400,7 @@ def forward_training_pass(
     monodepth_output = predictor.monodepth_model(source_image)
     predicted_disparity = monodepth_output.disparity
     metric_depth = disparity_factor[:, :, None, None] / predicted_disparity.clamp(min=1e-4)
-    aligned_depth, _ = predictor.depth_alignment(
+    aligned_depth, depth_alignment_map = predictor.depth_alignment(
         metric_depth,
         source_depth,
         monodepth_output.decoder_features,
@@ -478,6 +508,9 @@ def forward_training_pass(
         "source_render_original": source_render_original,
         "refined_target_render_original": refined_target_render_original,
         "aligned_depth": aligned_depth,
+        "depth_alignment_map": depth_alignment_map,
+        "delta_values": delta_values,
+        "gaussians_ndc": gaussians_ndc,
         "invisible_mask": invisible_mask,
         "invisible_target_render": invisible_target_render,
     }
