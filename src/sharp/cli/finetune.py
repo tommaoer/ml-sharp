@@ -14,6 +14,7 @@ from typing import Any
 import click
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from sharp.cli.predict import DEFAULT_MODEL_URL
@@ -24,7 +25,8 @@ from sharp.training.dataset import (
     collate_view_pairs,
 )
 from sharp.training.losses import FineTuneLoss, FineTuneLossWeights
-from sharp.utils import io
+from sharp.training.refinement import MaskDeltaRefiner
+from sharp.utils import io, vis
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import Gaussians3D, unproject_gaussians
 from sharp.utils.gsplat import GSplatRenderer, RenderingOutputs
@@ -132,6 +134,7 @@ def finetune_cli(
     LOGGER.info("Using device %s", device_t)
 
     predictor = build_finetune_predictor(checkpoint_path).to(device_t)
+    refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
     if data_root is not None:
         dataset = MultiScenePosedVideoDataset(
             data_root=data_root,
@@ -178,15 +181,24 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names: list[str] = []
+    trainable_module_names = ["feature_model", "refiner"]
     trainable_parameter_names = [
-        name for name, param in predictor.named_parameters() if param.requires_grad
+        f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
+    ] + [
+        f"refiner.{name}" for name, _ in refiner.named_parameters()
     ]
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
+    ) + sum(param.numel() for param in refiner.parameters())
+    LOGGER.info(
+        "Optimizing modules: %s (%d parameters)",
+        ", ".join(trainable_module_names),
+        trainable_parameter_count,
     )
-    LOGGER.info("All predictor modules are frozen; no parameters will be optimized.")
-    optimizer = None
+    trainable_parameters = [
+        param for _, param in predictor.named_parameters() if param.requires_grad
+    ] + list(refiner.parameters())
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     write_config(
         output_dir / "finetune_config.json",
@@ -215,10 +227,11 @@ def finetune_cli(
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
 
-            outputs = forward_training_pass(predictor, renderer, batch)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = forward_training_pass(predictor, renderer, batch, refiner)
             losses = loss_module(
                 source_render=outputs["source_render"],
-                target_render=outputs["target_render"],
+                target_render=outputs["refined_target_render"],
                 batch=batch,
                 aligned_depth=outputs["aligned_depth"],
             )
@@ -227,7 +240,8 @@ def finetune_cli(
                 LOGGER.info("Saving visualization at epoch=0 step=0 before optimization")
                 save_visualization_batch(visualization_dir, global_step, batch, outputs)
 
-            # Intentionally skip backward/optimizer updates: all networks are frozen.
+            losses.total.backward()
+            optimizer.step()
 
             global_step += 1
             if global_step % log_every == 0:
@@ -253,6 +267,7 @@ def finetune_cli(
                 save_checkpoint(
                     output_dir / f"step_{global_step:06d}.pt",
                     predictor,
+                    refiner,
                     optimizer,
                     global_step,
                 )
@@ -262,7 +277,7 @@ def finetune_cli(
         if max_steps > 0 and global_step >= max_steps:
             break
 
-    save_checkpoint(output_dir / "last.pt", predictor, optimizer, global_step)
+    save_checkpoint(output_dir / "last.pt", predictor, refiner, optimizer, global_step)
 
 
 def resolve_device(device: str) -> torch.device:
@@ -277,11 +292,13 @@ def resolve_device(device: str) -> torch.device:
 
 
 def build_finetune_predictor(checkpoint_path: Path | None):
-    """Create SHARP predictor with all modules frozen."""
+    """Create SHARP predictor and unfreeze only the feature model."""
     params = PredictorParams()
     predictor = create_predictor(params)
     predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
     predictor.requires_grad_(False)
+    predictor.feature_model.requires_grad_(True)
+    predictor.prediction_head.requires_grad_(False)
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
@@ -324,6 +341,7 @@ def forward_training_pass(
     predictor,
     renderer: GSplatRenderer,
     batch: dict[str, torch.Tensor | None],
+    refiner: MaskDeltaRefiner,
 ) -> dict[str, torch.Tensor | RenderingOutputs | Gaussians3D]:
     """Run input-frame -> NDC Gaussians -> world-space -> target rendering."""
     source_image = batch["source_image"]
@@ -371,26 +389,11 @@ def forward_training_pass(
     )
 
     image_shape = (source_image.shape[-1], source_image.shape[-2])
-    identity_extrinsics = torch.eye(4, device=source_image.device, dtype=source_image.dtype)[None]
-    identity_extrinsics = identity_extrinsics.repeat(source_image.shape[0], 1, 1)
-    gaussians_camera = batch_unproject_gaussians(
-        gaussians_ndc,
-        identity_extrinsics,
-        source_intrinsics,
-        image_shape,
-    )
     gaussians_world = batch_unproject_gaussians(
         gaussians_ndc,
         source_extrinsics,
         source_intrinsics,
         image_shape,
-    )
-    source_camera_render = renderer(
-        gaussians_camera,
-        identity_extrinsics,
-        source_intrinsics,
-        image_width=source_image.shape[-1],
-        image_height=source_image.shape[-2],
     )
     source_render = renderer(
         gaussians_world,
@@ -406,13 +409,51 @@ def forward_training_pass(
         image_width=source_image.shape[-1],
         image_height=source_image.shape[-2],
     )
-    source_camera_render_original = render_batch_at_sizes(
-        renderer,
-        gaussians_camera,
-        identity_extrinsics,
-        source_original_intrinsics,
-        source_original_size,
+
+    invisible_mask = compute_target_invisible_mask(
+        aligned_depth[:, 0:1],
+        source_intrinsics,
+        source_extrinsics,
+        target_intrinsics,
+        target_extrinsics,
     )
+    gaussian_invisible_gate = compute_gaussian_invisible_gate(
+        gaussians_world,
+        target_intrinsics,
+        target_extrinsics,
+        invisible_mask,
+        delta_values.shape[2],
+        delta_values.shape[-2],
+        delta_values.shape[-1],
+    )
+    refiner_size = delta_values.shape[-2:]
+    invisible_target_render = target_render.color * invisible_mask
+    delta_correction = refiner(
+        F.interpolate(source_image, size=refiner_size, mode="bilinear", align_corners=True),
+        F.interpolate(target_render.color, size=refiner_size, mode="bilinear", align_corners=True),
+        F.interpolate(invisible_target_render, size=refiner_size, mode="bilinear", align_corners=True),
+        F.interpolate(invisible_mask, size=refiner_size, mode="nearest"),
+    )
+    delta_correction = delta_correction * gaussian_invisible_gate
+    refined_gaussians_ndc = predictor.gaussian_composer(
+        delta=delta_values + delta_correction,
+        base_values=init_output.gaussian_base_values,
+        global_scale=init_output.global_scale,
+    )
+    refined_gaussians_world = batch_unproject_gaussians(
+        refined_gaussians_ndc,
+        source_extrinsics,
+        source_intrinsics,
+        image_shape,
+    )
+    refined_target_render = renderer(
+        refined_gaussians_world,
+        target_extrinsics,
+        target_intrinsics,
+        image_width=source_image.shape[-1],
+        image_height=source_image.shape[-2],
+    )
+
     source_render_original = render_batch_at_sizes(
         renderer,
         gaussians_world,
@@ -420,26 +461,132 @@ def forward_training_pass(
         source_original_intrinsics,
         source_original_size,
     )
-    target_render_original = render_batch_at_sizes(
+    refined_target_render_original = render_batch_at_sizes(
         renderer,
-        gaussians_world,
+        refined_gaussians_world,
         target_extrinsics,
         target_original_intrinsics,
         target_original_size,
     )
 
     return {
-        "gaussians_camera": gaussians_camera,
         "gaussians_world": gaussians_world,
-        "source_camera_render": source_camera_render,
+        "refined_gaussians_world": refined_gaussians_world,
         "source_render": source_render,
         "target_render": target_render,
-        "source_camera_render_original": source_camera_render_original,
+        "refined_target_render": refined_target_render,
         "source_render_original": source_render_original,
-        "target_render_original": target_render_original,
+        "refined_target_render_original": refined_target_render_original,
         "aligned_depth": aligned_depth,
+        "invisible_mask": invisible_mask,
+        "invisible_target_render": invisible_target_render,
     }
 
+
+
+def compute_target_invisible_mask(
+    source_depth: torch.Tensor,
+    source_intrinsics: torch.Tensor,
+    source_extrinsics: torch.Tensor,
+    target_intrinsics: torch.Tensor,
+    target_extrinsics: torch.Tensor,
+) -> torch.Tensor:
+    """Estimate target-view regions visible in target but not source."""
+    batch_size, _, height, width = source_depth.shape
+    device = source_depth.device
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device, dtype=torch.float32),
+        torch.arange(width, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    xx = xx[None].expand(batch_size, -1, -1)
+    yy = yy[None].expand(batch_size, -1, -1)
+    z = source_depth[:, 0]
+
+    fx = source_intrinsics[:, 0, 0][:, None, None]
+    fy = source_intrinsics[:, 1, 1][:, None, None]
+    cx = source_intrinsics[:, 0, 2][:, None, None]
+    cy = source_intrinsics[:, 1, 2][:, None, None]
+
+    x = (xx - cx) / fx * z
+    y = (yy - cy) / fy * z
+    points_cam = torch.stack([x, y, z, torch.ones_like(z)], dim=-1)
+
+    source_c2w = torch.linalg.inv(source_extrinsics)
+    points_world = points_cam.reshape(batch_size, -1, 4) @ source_c2w.transpose(-1, -2)
+    points_target = points_world @ target_extrinsics.transpose(-1, -2)
+    points_target = points_target[..., :3]
+
+    z_t = points_target[..., 2]
+    u = target_intrinsics[:, 0, 0][:, None] * (points_target[..., 0] / z_t.clamp(min=1e-6))
+    u = u + target_intrinsics[:, 0, 2][:, None]
+    v = target_intrinsics[:, 1, 1][:, None] * (points_target[..., 1] / z_t.clamp(min=1e-6))
+    v = v + target_intrinsics[:, 1, 2][:, None]
+
+    u0 = torch.floor(u)
+    v0 = torch.floor(v)
+    z_buffer = torch.full((batch_size, height * width), float("inf"), device=device)
+
+    for du, dv in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)):
+        uu = (u0 + du).long()
+        vv = (v0 + dv).long()
+        valid = (z_t > 1e-4) & (uu >= 0) & (uu < width) & (vv >= 0) & (vv < height)
+        flat_indices = vv * width + uu
+        for batch_index in range(batch_size):
+            valid_indices = flat_indices[batch_index][valid[batch_index]]
+            valid_depths = z_t[batch_index][valid[batch_index]]
+            if valid_indices.numel() > 0:
+                z_buffer[batch_index].scatter_reduce_(
+                    0, valid_indices, valid_depths, reduce="amin", include_self=True
+                )
+
+    coverage = torch.isfinite(z_buffer).float().view(batch_size, 1, height, width)
+    coverage = F.max_pool2d(coverage, kernel_size=3, stride=1, padding=1)
+    return 1.0 - coverage
+
+
+def compute_gaussian_invisible_gate(
+    gaussians_world: Gaussians3D,
+    target_intrinsics: torch.Tensor,
+    target_extrinsics: torch.Tensor,
+    invisible_mask: torch.Tensor,
+    num_layers: int,
+    grid_height: int,
+    grid_width: int,
+) -> torch.Tensor:
+    """Gate updates to gaussians projected into target-invisible regions."""
+    batch_size, num_gaussians, _ = gaussians_world.mean_vectors.shape
+    means_world = torch.cat(
+        [
+            gaussians_world.mean_vectors,
+            torch.ones(batch_size, num_gaussians, 1, device=gaussians_world.mean_vectors.device),
+        ],
+        dim=-1,
+    )
+    means_target = means_world @ target_extrinsics.transpose(-1, -2)
+    means_target = means_target[..., :3]
+
+    z = means_target[..., 2].clamp(min=1e-6)
+    u = target_intrinsics[:, 0, 0][:, None] * (means_target[..., 0] / z)
+    u = u + target_intrinsics[:, 0, 2][:, None]
+    v = target_intrinsics[:, 1, 1][:, None] * (means_target[..., 1] / z)
+    v = v + target_intrinsics[:, 1, 2][:, None]
+
+    norm_u = 2.0 * (u / max(invisible_mask.shape[-1] - 1, 1)) - 1.0
+    norm_v = 2.0 * (v / max(invisible_mask.shape[-2] - 1, 1)) - 1.0
+    grid = torch.stack([norm_u, norm_v], dim=-1).view(batch_size, num_gaussians, 1, 2)
+    sampled_mask = F.grid_sample(
+        invisible_mask,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).view(batch_size, num_gaussians)
+
+    valid = (means_target[..., 2] > 1e-4).float()
+    sampled_mask = sampled_mask * valid
+    gate = sampled_mask.view(batch_size, num_layers, grid_height, grid_width)
+    return gate[:, None]
 
 
 def render_batch_at_sizes(
@@ -519,65 +666,47 @@ def save_visualization_batch(
     assert isinstance(source_original_image, list)
     assert isinstance(target_original_image, list)
 
-    source_camera_render = outputs["source_camera_render"]
     source_render = outputs["source_render"]
     target_render = outputs["target_render"]
-    source_camera_render_original = outputs["source_camera_render_original"]
+    refined_target_render = outputs["refined_target_render"]
     source_render_original = outputs["source_render_original"]
-    target_render_original = outputs["target_render_original"]
-    assert isinstance(source_camera_render, RenderingOutputs)
+    refined_target_render_original = outputs["refined_target_render_original"]
+    invisible_mask = outputs["invisible_mask"]
+    invisible_target_render = outputs["invisible_target_render"]
     assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
-    assert isinstance(source_camera_render_original, list)
+    assert isinstance(refined_target_render, RenderingOutputs)
     assert isinstance(source_render_original, list)
-    assert isinstance(target_render_original, list)
+    assert isinstance(refined_target_render_original, list)
+    assert isinstance(invisible_mask, torch.Tensor)
+    assert isinstance(invisible_target_render, torch.Tensor)
 
     prefix = output_dir / f"step_{global_step:06d}"
     save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.train.png"))
     save_tensor_image(target_image[0], prefix.with_name(prefix.name + ".target.train.png"))
     save_tensor_image(source_original_image[0], prefix.with_name(prefix.name + ".source.png"))
     save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
+    save_mask_image(invisible_mask[0], prefix.with_name(prefix.name + ".invisible_mask.png"))
     save_tensor_image(
-        source_camera_render.color[0].clamp(0.0, 1.0),
-        prefix.with_name(prefix.name + ".source_render_camera.train.png"),
+        (invisible_target_render[0]).clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".invisible_target_render.png"),
     )
     save_tensor_image(
         source_render.color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".source_render.train.png"),
     )
     save_tensor_image(
-        target_render.color[0].clamp(0.0, 1.0),
-        prefix.with_name(prefix.name + ".target_render.train.png"),
-    )
-    save_tensor_image(
-        source_camera_render_original[0].color[0].clamp(0.0, 1.0),
-        prefix.with_name(prefix.name + ".source_render_camera.png"),
-    )
-    save_tensor_image(
         source_render_original[0].color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".source_render.png"),
     )
     save_tensor_image(
-        target_render_original[0].color[0].clamp(0.0, 1.0),
+        refined_target_render.color[0].clamp(0.0, 1.0),
+        prefix.with_name(prefix.name + ".target_render.train.png"),
+    )
+    save_tensor_image(
+        refined_target_render_original[0].color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".target_render.png"),
     )
-
-    if isinstance(source_image, torch.Tensor):
-        camera_l1 = (source_camera_render.color[0] - source_image[0]).abs().mean().item()
-        world_l1 = (source_render.color[0] - source_image[0]).abs().mean().item()
-        delta_l1 = (source_render.color[0] - source_camera_render.color[0]).abs().mean().item()
-        metrics_path = prefix.with_name(prefix.name + ".source_render_metrics.txt")
-        metrics_path.write_text(
-            "\n".join(
-                [
-                    f"source_camera_render_l1={camera_l1:.8f}",
-                    f"source_world_render_l1={world_l1:.8f}",
-                    f"source_world_vs_camera_l1={delta_l1:.8f}",
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
 
 
 def save_tensor_image(tensor: torch.Tensor, path: Path) -> None:
@@ -586,11 +715,17 @@ def save_tensor_image(tensor: torch.Tensor, path: Path) -> None:
     io.save_image((image * 255.0).astype(np.uint8), path)
 
 
+def save_mask_image(mask: torch.Tensor, path: Path) -> None:
+    """Save a mask visualization."""
+    colorized = vis.colorize_alpha(mask.detach().cpu())[None][0].permute(1, 2, 0).numpy()
+    io.save_image(colorized.astype(np.uint8), path)
+
 
 def save_checkpoint(
     path: Path,
     predictor,
-    optimizer: torch.optim.Optimizer | None,
+    refiner,
+    optimizer: torch.optim.Optimizer,
     global_step: int,
 ) -> None:
     """Save a training checkpoint."""
@@ -598,7 +733,8 @@ def save_checkpoint(
     torch.save(
         {
             "predictor": predictor.state_dict(),
-            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+            "refiner": refiner.state_dict(),
+            "optimizer": optimizer.state_dict(),
             "global_step": global_step,
         },
         path,
