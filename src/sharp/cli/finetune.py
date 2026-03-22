@@ -83,6 +83,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--alpha-weight", type=float, default=0.05, show_default=True)
 @click.option("--perceptual-weight", type=float, default=0.1, show_default=True)
 @click.option("--depth-tv-weight", type=float, default=0.01, show_default=True)
+@click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def finetune_cli(
     data_root: Path | None,
@@ -110,6 +111,7 @@ def finetune_cli(
     alpha_weight: float,
     perceptual_weight: float,
     depth_tv_weight: float,
+    low_pass_filter_eps: float,
     verbose: bool,
 ) -> None:
     """Fine-tune SHARP on a posed video sequence."""
@@ -163,7 +165,7 @@ def finetune_cli(
     renderer = GSplatRenderer(
         color_space="linearRGB",
         background_color="black",
-        low_pass_filter_eps=1e-2,
+        low_pass_filter_eps=low_pass_filter_eps,
     ).to(device_t)
     loss_module = FineTuneLoss(
         weights=FineTuneLossWeights(
@@ -196,6 +198,7 @@ def finetune_cli(
             "min_frame_distance": min_frame_distance,
             "max_frame_distance": max_frame_distance,
             "visualize_every": visualize_every,
+            "low_pass_filter_eps": low_pass_filter_eps,
         },
     )
 
