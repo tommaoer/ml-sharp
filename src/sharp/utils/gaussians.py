@@ -163,7 +163,7 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
         opacities=gaussians.opacities,
     )
 
-def decompose_covariance_matrices(
+def decompose_covariance_matrices1(
     covariance_matrices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decompose 3D covariance matrices into quaternions and singular values.
@@ -197,6 +197,43 @@ def decompose_covariance_matrices(
     if reflection_mask.any():
         rotations[reflection_mask, :, -1] *= -1
 
+    quaternions = linalg.quaternions_from_rotation_matrices(rotations)
+    quaternions = quaternions.to(dtype=dtype, device=device)
+    singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
+    return quaternions, singular_values
+
+def decompose_covariance_matrices(
+    covariance_matrices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decompose 3D covariance matrices into quaternions and singular values.
+
+    Args:
+        covariance_matrices: The covariance matrices to decompose.
+
+    Returns:
+        Quaternion and singular values corresponding to the orientation and scales of
+        the diagonalized matrix.
+
+    Note: This operation is not differentiable.
+    """
+    device = covariance_matrices.device
+    dtype = covariance_matrices.dtype
+
+    # We convert to fp64 to avoid numerical errors.
+    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
+    rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+
+    # NOTE: in SVD, it is possible that U and VT are both reflections.
+    # We need to correct them.
+    batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
+    num_reflections = len(gaussian_idx)
+    if num_reflections > 0:
+        LOGGER.warning(
+            "Received %d reflection matrices from SVD. Flipping them to rotations.",
+            num_reflections,
+        )
+        # Flip the last column of reflection and make it a rotation.
+        rotations[batch_idx, gaussian_idx, :, -1] *= -1
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
