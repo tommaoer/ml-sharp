@@ -1,0 +1,16 @@
+{
+  "data_root": "../../ml-sharpv1/prepared_videos",
+  "checkpoint_path": "../../ml-sharpv1/sharp_2572gikvuh.pt",
+  "device": "cuda",
+  "batch_size": 1,
+  "num_workers": 2,
+  "epochs": 1,
+  "lr": 1e-05,
+  "weight_decay": 0.0001,
+  "samples_per_scene": 32,
+  "max_frame_gap": 24,
+  "min_frame_distance": 1,
+  "preload_video": false,
+  "perceptual": true,
+  "depth_loss": false
+}

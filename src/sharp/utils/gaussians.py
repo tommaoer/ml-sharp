@@ -98,7 +98,7 @@ def unproject_gaussians(
     return gaussians
 
 
-def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+def apply_transform1(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
     Args:
@@ -130,6 +130,77 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
         opacities=gaussians.opacities,
     )
 
+
+def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+    """Apply an affine transformation to 3D Gaussians.
+
+    Args:
+        gaussians: The Gaussians to transform.
+        transform: An affine transform with shape 3x4.
+
+    Returns:
+        The transformed Gaussians.
+
+    Note: This operation is not differentiable.
+    """
+    transform_linear = transform[..., :3, :3]
+    transform_offset = transform[..., :3, 3]
+
+    mean_vectors = gaussians.mean_vectors @ transform_linear.transpose(-1, -2) + transform_offset
+    covariance_matrices = compose_covariance_matrices(
+        gaussians.quaternions, gaussians.singular_values
+    )
+    covariance_matrices = (
+        transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
+    )
+    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+
+    return Gaussians3D(
+        mean_vectors=mean_vectors,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities,
+    )
+
+def decompose_covariance_matrices1(
+    covariance_matrices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decompose 3D covariance matrices into quaternions and singular values.
+
+    Args:
+        covariance_matrices: The covariance matrices to decompose.
+
+    Returns:
+        Quaternion and singular values corresponding to the orientation and scales of
+        the diagonalized matrix.
+
+    Note: This operation is not differentiable.
+    """
+    device = covariance_matrices.device
+    dtype = covariance_matrices.dtype
+
+    # The covariance matrices are symmetric positive semidefinite, so an eigenvalue
+    # decomposition is numerically better suited than SVD here and avoids spurious
+    # reflection warnings caused by sign ambiguity in singular vectors.
+    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
+    covariance_matrices = 0.5 * (
+        covariance_matrices + covariance_matrices.transpose(-1, -2)
+    )
+    eigenvalues, rotations = torch.linalg.eigh(covariance_matrices)
+
+    eigenvalues = eigenvalues.clamp(min=0.0)
+    rotations = torch.flip(rotations, dims=[-1])
+    singular_values_2 = torch.flip(eigenvalues, dims=[-1])
+
+    reflection_mask = torch.linalg.det(rotations) < 0
+    if reflection_mask.any():
+        rotations[reflection_mask, :, -1] *= -1
+
+    quaternions = linalg.quaternions_from_rotation_matrices(rotations)
+    quaternions = quaternions.to(dtype=dtype, device=device)
+    singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
+    return quaternions, singular_values
 
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,

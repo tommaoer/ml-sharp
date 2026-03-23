@@ -66,6 +66,44 @@ sharp predict -i /path/to/input/images -o /path/to/output/gaussians --render
 sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
 ```
 
+
+## Fine-tuning on posed videos
+
+This repository now also includes a scene fine-tuning entrypoint for either a **single posed video** or a **directory of many scene folders**. The training loop follows the requested pipeline:
+
+1. Randomly sample an input frame.
+2. Run the pretrained SHARP predictor to obtain Gaussians in NDC space.
+3. Map these Gaussians to world space with the input-frame intrinsics/extrinsics.
+4. Randomly sample a target frame with a configurable frame-distance range.
+5. Render the world-space Gaussians in the target camera and optimize the Gaussian Decoder.
+
+Expected multi-scene input layout:
+
+```
+/path/to/data_root/
+  scene_000/
+    video.mp4
+    poses.json
+  scene_001/
+    clip.mp4
+    cameras.json
+```
+
+Each JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. A typical multi-scene command is:
+
+```
+sharp finetune \
+  --data-root /path/to/data_root \
+  --output-dir /path/to/output_dir \
+  --checkpoint-path /path/to/sharp_2572gikvuh.pt \
+  --min-frame-distance 4 \
+  --max-frame-distance 48
+```
+
+If you only want to fine-tune on one video, you can still pass `--video-path` and `--pose-path`.
+
+The command keeps the network input at `1536x1536`, but it also preserves each frame's original resolution for debugging renders. Fine-tuning updates the predictor `feature_model` together with a mask-guided Gaussian refiner, while the other predictor modules stay frozen. The target-view supervision now detects regions that are visible in the target view but invisible from the source view, predicts additive Gaussian deltas for those gated Gaussians, and re-renders the refined target view. Each visualization step saves 10 images: source/target frames at training and original resolution, the target-invisible mask, the masked target-region render, source-view Gaussian renders at training and original resolution, and target-view Gaussian renders at training and original resolution. A `step_000000.*` visualization is still saved at `epoch=0, step=0` before that iteration's optimizer update. By default, fine-tuning uses `--low-pass-filter-eps 0.0` so the debug renders match the standard SHARP render path instead of adding extra smoothing. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
+
 ## Evaluation
 
 Please refer to the paper for both quantitative and qualitative evaluations.
