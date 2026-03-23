@@ -148,23 +148,21 @@ def decompose_covariance_matrices(
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
 
-    # The covariance matrices are symmetric positive semidefinite, so an eigenvalue
-    # decomposition is numerically better suited than SVD here and avoids spurious
-    # reflection warnings caused by sign ambiguity in singular vectors.
+    # We convert to fp64 to avoid numerical errors.
     covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
-    covariance_matrices = 0.5 * (
-        covariance_matrices + covariance_matrices.transpose(-1, -2)
-    )
-    eigenvalues, rotations = torch.linalg.eigh(covariance_matrices)
+    rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
 
-    eigenvalues = eigenvalues.clamp(min=0.0)
-    rotations = torch.flip(rotations, dims=[-1])
-    singular_values_2 = torch.flip(eigenvalues, dims=[-1])
-
-    reflection_mask = torch.linalg.det(rotations) < 0
-    if reflection_mask.any():
-        rotations[reflection_mask, :, -1] *= -1
-
+    # NOTE: in SVD, it is possible that U and VT are both reflections.
+    # We need to correct them.
+    batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
+    num_reflections = len(gaussian_idx)
+    if num_reflections > 0:
+        LOGGER.warning(
+            "Received %d reflection matrices from SVD. Flipping them to rotations.",
+            num_reflections,
+        )
+        # Flip the last column of reflection and make it a rotation.
+        rotations[batch_idx, gaussian_idx, :, -1] *= -1
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
