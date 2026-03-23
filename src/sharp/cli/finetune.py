@@ -147,7 +147,7 @@ def finetune_cli(
 
     predictor = build_finetune_predictor(checkpoint_path).to(device_t)
     refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
-    refiner.requires_grad_(mask_guided)
+    refiner.requires_grad_(True)
     if data_root is not None:
         dataset = MultiScenePosedVideoDataset(
             data_root=data_root,
@@ -199,7 +199,7 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names = ["refiner"] if mask_guided else []
+    trainable_module_names = ["refiner"]
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
     ] + [
@@ -208,11 +208,6 @@ def finetune_cli(
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     ) + sum(param.numel() for param in refiner.parameters() if param.requires_grad)
-    if trainable_parameter_count == 0:
-        raise click.UsageError(
-            "Mask-guided refinement is disabled, so there are no trainable parameters. "
-            "Re-run with --mask-guided to fine-tune the Gaussian refiner."
-        )
     LOGGER.info(
         "Optimizing modules: %s (%d parameters)",
         ", ".join(trainable_module_names),
@@ -472,26 +467,35 @@ def forward_training_pass(
     )
     refiner_size = delta_values.shape[-2:]
     invisible_target_render = target_render.color * invisible_mask
-    if use_mask_guided_refinement:
-        delta_correction = refiner(
-            F.interpolate(source_image, size=refiner_size, mode="bilinear", align_corners=True),
-            F.interpolate(
-                target_render.color,
-                size=refiner_size,
-                mode="bilinear",
-                align_corners=True,
-            ),
-            F.interpolate(
-                invisible_target_render,
-                size=refiner_size,
-                mode="bilinear",
-                align_corners=True,
-            ),
-            F.interpolate(invisible_mask, size=refiner_size, mode="nearest"),
+    refinement_mask = F.interpolate(invisible_mask, size=refiner_size, mode="nearest")
+    masked_target_refiner_input = F.interpolate(
+        invisible_target_render,
+        size=refiner_size,
+        mode="bilinear",
+        align_corners=True,
+    )
+    if not use_mask_guided_refinement:
+        refinement_mask = torch.ones_like(refinement_mask)
+        masked_target_refiner_input = F.interpolate(
+            target_render.color,
+            size=refiner_size,
+            mode="bilinear",
+            align_corners=True,
         )
+
+    delta_correction = refiner(
+        F.interpolate(source_image, size=refiner_size, mode="bilinear", align_corners=True),
+        F.interpolate(
+            target_render.color,
+            size=refiner_size,
+            mode="bilinear",
+            align_corners=True,
+        ),
+        masked_target_refiner_input,
+        refinement_mask,
+    )
+    if use_mask_guided_refinement:
         delta_correction = delta_correction * gaussian_invisible_gate
-    else:
-        delta_correction = torch.zeros_like(delta_values)
     refined_gaussians_ndc = predictor.gaussian_composer(
         delta=delta_values + delta_correction,
         base_values=init_output.gaussian_base_values,

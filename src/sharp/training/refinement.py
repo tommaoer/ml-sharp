@@ -14,10 +14,10 @@ from sharp.models.encoders import UNetEncoder
 
 
 class MaskDeltaRefiner(nn.Module):
-    """Predicts additive Gaussian delta corrections on target-invisible regions."""
+    """Predicts additive Gaussian delta corrections, optionally masked per region."""
 
     def __init__(self, num_layers: int, width: list[int] | None = None, steps: int = 4) -> None:
-        """Initialize the mask-guided delta refiner."""
+        """Initialize the Gaussian delta refiner."""
         super().__init__()
         if width is None:
             width = [32, 64, 128, 256, 256]
