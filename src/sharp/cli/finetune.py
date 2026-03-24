@@ -80,6 +80,12 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--max-steps", type=int, default=0, show_default=True)
 @click.option("--preload-video/--stream-video", default=False, show_default=True)
 @click.option("--mask-guided/--no-mask-guided", default=False, show_default=True)
+@click.option(
+    "--refiner-update-covariance/--refiner-color-only",
+    default=False,
+    show_default=True,
+    help="Whether refiner updates covariance (scale/quaternion) in addition to color.",
+)
 @click.option("--perceptual/--no-perceptual", default=True, show_default=True)
 @click.option("--depth-loss/--no-depth-loss", default=False, show_default=True)
 @click.option("--color-weight", type=float, default=1.0, show_default=True)
@@ -114,6 +120,7 @@ def finetune_cli(
     max_steps: int,
     preload_video: bool,
     mask_guided: bool,
+    refiner_update_covariance: bool,
     perceptual: bool,
     depth_loss: bool,
     color_weight: float,
@@ -146,8 +153,11 @@ def finetune_cli(
     LOGGER.info("Using device %s", device_t)
 
     predictor = build_finetune_predictor(checkpoint_path).to(device_t)
-    refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
-    refiner.requires_grad_(False)
+    refiner = MaskDeltaRefiner(
+        num_layers=predictor.init_model.num_layers,
+        update_covariance=refiner_update_covariance,
+    ).to(device_t)
+    refiner.requires_grad_(True)
     internal_resolution = (1536, 1536)
     refiner_stride = predictor.init_model.stride
     refiner_resolution = (
@@ -207,7 +217,7 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names: list[str] = []
+    trainable_module_names = ["refiner"]
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
     ] + [
@@ -216,14 +226,15 @@ def finetune_cli(
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     ) + sum(param.numel() for param in refiner.parameters() if param.requires_grad)
-    LOGGER.info("Optimizing modules: %s (%d parameters)", "none", trainable_parameter_count)
+    LOGGER.info(
+        "Optimizing modules: %s (%d parameters)",
+        ", ".join(trainable_module_names),
+        trainable_parameter_count,
+    )
     trainable_parameters = [
         param for _, param in predictor.named_parameters() if param.requires_grad
     ] + [param for param in refiner.parameters() if param.requires_grad]
-    optimizer: torch.optim.Optimizer | None = None
-    if trainable_parameters:
-        optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
-    LOGGER.info("Network optimization is disabled; running finetune loop in evaluation mode.")
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     write_config(
         output_dir / "finetune_config.json",
@@ -244,6 +255,7 @@ def finetune_cli(
             "internal_resolution": list(internal_resolution),
             "refiner_resolution": list(refiner_resolution),
             "mask_guided": mask_guided,
+            "refiner_update_covariance": refiner_update_covariance,
             "grad_weight": grad_weight,
             "delta_weight": delta_weight,
             "splat_weight": splat_weight,
@@ -260,6 +272,7 @@ def finetune_cli(
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
 
+            optimizer.zero_grad(set_to_none=True)
             outputs = forward_training_pass(
                 predictor,
                 renderer,
@@ -281,6 +294,9 @@ def finetune_cli(
             if epoch == 0 and global_step == 0:
                 LOGGER.info("Saving visualization at epoch=0 step=0 before optimization")
                 save_visualization_batch(visualization_dir, global_step, batch, outputs)
+
+            losses.total.backward()
+            optimizer.step()
 
             global_step += 1
             if global_step % log_every == 0:

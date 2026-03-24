@@ -16,11 +16,17 @@ from sharp.models.encoders import UNetEncoder
 class MaskDeltaRefiner(nn.Module):
     """Predicts additive Gaussian delta corrections, optionally masked per region.
 
-    The refiner only updates covariance-related and color channels. Position and
-    opacity deltas are forced to zero.
+    By default, the refiner only updates color channels to keep Gaussian geometry
+    fixed. Covariance updates can be optionally enabled.
     """
 
-    def __init__(self, num_layers: int, width: list[int] | None = None, steps: int = 4) -> None:
+    def __init__(
+        self,
+        num_layers: int,
+        width: list[int] | None = None,
+        steps: int = 4,
+        update_covariance: bool = False,
+    ) -> None:
         """Initialize the Gaussian delta refiner."""
         super().__init__()
         if width is None:
@@ -32,9 +38,11 @@ class MaskDeltaRefiner(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
         channel_update_mask = torch.zeros(1, 14, 1, 1, 1, dtype=torch.float32)
-        # Keep covariance-related channels (scales and quaternions) and color channels:
-        # 3:6 (scale), 6:10 (quaternion), 10:13 (color).
-        channel_update_mask[:, 3:13] = 1.0
+        # Keep color channels by default (10:13).
+        channel_update_mask[:, 10:13] = 1.0
+        if update_covariance:
+            # Optionally enable covariance-related channels: 3:6 (scale), 6:10 (quaternion).
+            channel_update_mask[:, 3:10] = 1.0
         self.register_buffer("channel_update_mask", channel_update_mask)
 
     def forward(
