@@ -148,10 +148,17 @@ def finetune_cli(
     predictor = build_finetune_predictor(checkpoint_path).to(device_t)
     refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
     refiner.requires_grad_(True)
+    internal_resolution = (1536, 1536)
+    refiner_stride = predictor.init_model.stride
+    refiner_resolution = (
+        internal_resolution[0] // refiner_stride,
+        internal_resolution[1] // refiner_stride,
+    )
     if data_root is not None:
         dataset = MultiScenePosedVideoDataset(
             data_root=data_root,
-            internal_resolution=(1536, 1536),
+            internal_resolution=internal_resolution,
+            refiner_resolution=refiner_resolution,
             min_frame_distance=min_frame_distance,
             max_frame_distance=max_frame_distance,
             samples_per_scene=samples_per_epoch,
@@ -162,7 +169,8 @@ def finetune_cli(
         dataset = PosedVideoDataset(
             video_path=video_path,
             pose_path=pose_path,
-            internal_resolution=(1536, 1536),
+            internal_resolution=internal_resolution,
+            refiner_resolution=refiner_resolution,
             min_frame_distance=min_frame_distance,
             max_frame_distance=max_frame_distance,
             samples_per_epoch=samples_per_epoch,
@@ -234,6 +242,8 @@ def finetune_cli(
             "max_frame_distance": max_frame_distance,
             "visualize_every": visualize_every,
             "low_pass_filter_eps": low_pass_filter_eps,
+            "internal_resolution": list(internal_resolution),
+            "refiner_resolution": list(refiner_resolution),
             "mask_guided": mask_guided,
             "grad_weight": grad_weight,
             "delta_weight": delta_weight,
@@ -387,6 +397,9 @@ def forward_training_pass(
     source_depth = batch["source_depth"]
     disparity_factor = batch["disparity_factor"]
     source_intrinsics = batch["source_intrinsics"]
+    source_refiner_image = batch["source_refiner_image"]
+    source_refiner_intrinsics = batch["source_refiner_intrinsics"]
+    target_refiner_intrinsics = batch["target_refiner_intrinsics"]
     source_original_intrinsics = batch["source_original_intrinsics"]
     source_original_size = batch["source_original_size"]
     source_extrinsics = batch["source_extrinsics"]
@@ -398,10 +411,13 @@ def forward_training_pass(
     assert isinstance(source_image, torch.Tensor)
     assert isinstance(disparity_factor, torch.Tensor)
     assert isinstance(source_intrinsics, torch.Tensor)
+    assert isinstance(source_refiner_image, torch.Tensor)
+    assert isinstance(source_refiner_intrinsics, torch.Tensor)
     assert isinstance(source_original_intrinsics, torch.Tensor)
     assert isinstance(source_original_size, torch.Tensor)
     assert isinstance(source_extrinsics, torch.Tensor)
     assert isinstance(target_intrinsics, torch.Tensor)
+    assert isinstance(target_refiner_intrinsics, torch.Tensor)
     assert isinstance(target_original_intrinsics, torch.Tensor)
     assert isinstance(target_original_size, torch.Tensor)
     assert isinstance(target_extrinsics, torch.Tensor)
@@ -448,7 +464,19 @@ def forward_training_pass(
         image_width=source_image.shape[-1],
         image_height=source_image.shape[-2],
     )
+    target_refiner_render = renderer(
+        gaussians_world,
+        target_extrinsics,
+        target_refiner_intrinsics,
+        image_width=source_refiner_image.shape[-1],
+        image_height=source_refiner_image.shape[-2],
+    )
 
+    aligned_depth_refiner = F.avg_pool2d(
+        aligned_depth[:, 0:1],
+        kernel_size=predictor.init_model.stride,
+        stride=predictor.init_model.stride,
+    )
     invisible_mask = compute_target_invisible_mask(
         aligned_depth[:, 0:1],
         source_intrinsics,
@@ -456,41 +484,32 @@ def forward_training_pass(
         target_intrinsics,
         target_extrinsics,
     )
+    refiner_invisible_mask = compute_target_invisible_mask(
+        aligned_depth_refiner,
+        source_refiner_intrinsics,
+        source_extrinsics,
+        target_refiner_intrinsics,
+        target_extrinsics,
+    )
     gaussian_invisible_gate = compute_gaussian_invisible_gate(
         gaussians_world,
-        target_intrinsics,
+        target_refiner_intrinsics,
         target_extrinsics,
-        invisible_mask,
+        refiner_invisible_mask,
         delta_values.shape[2],
         delta_values.shape[-2],
         delta_values.shape[-1],
     )
-    refiner_size = delta_values.shape[-2:]
-    invisible_target_render = target_render.color * invisible_mask
-    refinement_mask = F.interpolate(invisible_mask, size=refiner_size, mode="nearest")
-    masked_target_refiner_input = F.interpolate(
-        invisible_target_render,
-        size=refiner_size,
-        mode="bilinear",
-        align_corners=True,
-    )
+    invisible_target_render = target_refiner_render.color * refiner_invisible_mask
+    refinement_mask = refiner_invisible_mask
+    masked_target_refiner_input = invisible_target_render
     if not use_mask_guided_refinement:
         refinement_mask = torch.ones_like(refinement_mask)
-        masked_target_refiner_input = F.interpolate(
-            target_render.color,
-            size=refiner_size,
-            mode="bilinear",
-            align_corners=True,
-        )
+        masked_target_refiner_input = target_refiner_render.color
 
     delta_correction = refiner(
-        F.interpolate(source_image, size=refiner_size, mode="bilinear", align_corners=True),
-        F.interpolate(
-            target_render.color,
-            size=refiner_size,
-            mode="bilinear",
-            align_corners=True,
-        ),
+        source_refiner_image,
+        target_refiner_render.color,
         masked_target_refiner_input,
         refinement_mask,
     )

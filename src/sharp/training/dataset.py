@@ -25,6 +25,8 @@ class FrameRecord:
 
     image: torch.Tensor
     intrinsics: torch.Tensor
+    refiner_image: torch.Tensor
+    refiner_intrinsics: torch.Tensor
     original_image: torch.Tensor
     original_intrinsics: torch.Tensor
     extrinsics: torch.Tensor
@@ -50,6 +52,7 @@ class PosedVideoScene:
         video_path: str | Path,
         pose_path: str | Path,
         internal_resolution: tuple[int, int] = (1536, 1536),
+        refiner_resolution: tuple[int, int] | None = None,
         preload: bool = False,
     ) -> None:
         """Initialize one posed-video scene."""
@@ -57,6 +60,7 @@ class PosedVideoScene:
         self.pose_path = Path(pose_path)
         self.scene_name = self.video_path.parent.name
         self.internal_resolution = internal_resolution
+        self.refiner_resolution = refiner_resolution or internal_resolution
         self.preload = preload
 
         with self.pose_path.open("r", encoding="utf-8") as handle:
@@ -126,9 +130,16 @@ class PosedVideoScene:
         original_image = self.load_frame(frame_index)
         _, height, width = original_image.shape
         target_height, target_width = self.internal_resolution
+        refiner_height, refiner_width = self.refiner_resolution
         image = F.interpolate(
             original_image[None],
             size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=True,
+        )[0]
+        refiner_image = F.interpolate(
+            original_image[None],
+            size=(refiner_height, refiner_width),
             mode="bilinear",
             align_corners=True,
         )[0]
@@ -139,9 +150,18 @@ class PosedVideoScene:
             target_width,
             target_height,
         )
+        refiner_intrinsics = self._scale_intrinsics(
+            self.intrinsics,
+            width,
+            height,
+            refiner_width,
+            refiner_height,
+        )
         return FrameRecord(
             image=image,
             intrinsics=intrinsics,
+            refiner_image=refiner_image,
+            refiner_intrinsics=refiner_intrinsics,
             original_image=original_image,
             original_intrinsics=self.intrinsics.clone(),
             extrinsics=torch.linalg.inv(self.c2ws[frame_index]),
@@ -157,6 +177,7 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
         video_path: str | Path,
         pose_path: str | Path,
         internal_resolution: tuple[int, int] = (1536, 1536),
+        refiner_resolution: tuple[int, int] | None = None,
         min_frame_distance: int = 4,
         max_frame_distance: int = 48,
         samples_per_epoch: int | None = None,
@@ -167,6 +188,7 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
             video_path=video_path,
             pose_path=pose_path,
             internal_resolution=internal_resolution,
+            refiner_resolution=refiner_resolution,
             preload=preload,
         )
         self.min_frame_distance = min_frame_distance
@@ -213,6 +235,7 @@ class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
         self,
         data_root: str | Path,
         internal_resolution: tuple[int, int] = (1536, 1536),
+        refiner_resolution: tuple[int, int] | None = None,
         min_frame_distance: int = 4,
         max_frame_distance: int = 48,
         samples_per_scene: int = 32,
@@ -250,6 +273,7 @@ class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
                     video_candidates[0],
                     json_candidates[0],
                     internal_resolution=internal_resolution,
+                    refiner_resolution=refiner_resolution,
                     preload=preload,
                 )
             )
@@ -295,10 +319,17 @@ def collate_view_pairs(batch: list[ViewPairSample]) -> dict[str, Any]:
         "scene_name": [item.scene_name for item in batch],
         "source_image": torch.stack([item.source.image for item in batch], dim=0),
         "target_image": torch.stack([item.target.image for item in batch], dim=0),
+        "source_refiner_image": torch.stack([item.source.refiner_image for item in batch], dim=0),
         "source_original_image": [item.source.original_image for item in batch],
         "target_original_image": [item.target.original_image for item in batch],
         "source_intrinsics": torch.stack([item.source.intrinsics for item in batch], dim=0),
         "target_intrinsics": torch.stack([item.target.intrinsics for item in batch], dim=0),
+        "source_refiner_intrinsics": torch.stack(
+            [item.source.refiner_intrinsics for item in batch], dim=0
+        ),
+        "target_refiner_intrinsics": torch.stack(
+            [item.target.refiner_intrinsics for item in batch], dim=0
+        ),
         "source_original_intrinsics": torch.stack(
             [item.source.original_intrinsics for item in batch], dim=0
         ),
