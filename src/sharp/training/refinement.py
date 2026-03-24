@@ -14,7 +14,11 @@ from sharp.models.encoders import UNetEncoder
 
 
 class MaskDeltaRefiner(nn.Module):
-    """Predicts additive Gaussian delta corrections, optionally masked per region."""
+    """Predicts additive Gaussian delta corrections, optionally masked per region.
+
+    The refiner only updates covariance-related and color channels. Position and
+    opacity deltas are forced to zero.
+    """
 
     def __init__(self, num_layers: int, width: list[int] | None = None, steps: int = 4) -> None:
         """Initialize the Gaussian delta refiner."""
@@ -27,6 +31,11 @@ class MaskDeltaRefiner(nn.Module):
         self.conv_out = nn.Conv2d(width[0], 14 * num_layers, kernel_size=1, stride=1)
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
+        channel_update_mask = torch.zeros(1, 14, 1, 1, 1, dtype=torch.float32)
+        # Keep covariance-related channels (scales and quaternions) and color channels:
+        # 3:6 (scale), 6:10 (quaternion), 10:13 (color).
+        channel_update_mask[:, 3:13] = 1.0
+        self.register_buffer("channel_update_mask", channel_update_mask)
 
     def forward(
         self,
@@ -51,7 +60,7 @@ class MaskDeltaRefiner(nn.Module):
             size=(height, width),
             mode="nearest",
         )
-        return delta * mask[:, None]
+        return delta * mask[:, None] * self.channel_update_mask
 
 
 __all__ = ["MaskDeltaRefiner"]
