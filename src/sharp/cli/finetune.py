@@ -147,7 +147,7 @@ def finetune_cli(
 
     predictor = build_finetune_predictor(checkpoint_path).to(device_t)
     refiner = MaskDeltaRefiner(num_layers=predictor.init_model.num_layers).to(device_t)
-    refiner.requires_grad_(True)
+    refiner.requires_grad_(False)
     internal_resolution = (1536, 1536)
     refiner_stride = predictor.init_model.stride
     refiner_resolution = (
@@ -207,7 +207,7 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names = ["refiner"]
+    trainable_module_names: list[str] = []
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
     ] + [
@@ -216,15 +216,14 @@ def finetune_cli(
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     ) + sum(param.numel() for param in refiner.parameters() if param.requires_grad)
-    LOGGER.info(
-        "Optimizing modules: %s (%d parameters)",
-        ", ".join(trainable_module_names),
-        trainable_parameter_count,
-    )
+    LOGGER.info("Optimizing modules: %s (%d parameters)", "none", trainable_parameter_count)
     trainable_parameters = [
         param for _, param in predictor.named_parameters() if param.requires_grad
     ] + [param for param in refiner.parameters() if param.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
+    optimizer: torch.optim.Optimizer | None = None
+    if trainable_parameters:
+        optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
+    LOGGER.info("Network optimization is disabled; running finetune loop in evaluation mode.")
 
     write_config(
         output_dir / "finetune_config.json",
@@ -261,7 +260,6 @@ def finetune_cli(
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
 
-            optimizer.zero_grad(set_to_none=True)
             outputs = forward_training_pass(
                 predictor,
                 renderer,
@@ -283,9 +281,6 @@ def finetune_cli(
             if epoch == 0 and global_step == 0:
                 LOGGER.info("Saving visualization at epoch=0 step=0 before optimization")
                 save_visualization_batch(visualization_dir, global_step, batch, outputs)
-
-            losses.total.backward()
-            optimizer.step()
 
             global_step += 1
             if global_step % log_every == 0:
@@ -808,7 +803,7 @@ def save_checkpoint(
     path: Path,
     predictor,
     refiner,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     global_step: int,
 ) -> None:
     """Save a training checkpoint."""
@@ -817,7 +812,7 @@ def save_checkpoint(
         {
             "predictor": predictor.state_dict(),
             "refiner": refiner.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "global_step": global_step,
         },
         path,
