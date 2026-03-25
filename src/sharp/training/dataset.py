@@ -87,9 +87,12 @@ class PosedVideoScene:
         depth_tensor = torch.from_numpy(depth_np).float()
         if depth_tensor.ndim == 3:
             depth_tensor = depth_tensor[:, None]
+        elif depth_tensor.ndim == 4 and depth_tensor.shape[-1] == 1:
+            depth_tensor = depth_tensor.permute(0, 3, 1, 2)
         if depth_tensor.ndim != 4 or depth_tensor.shape[1] != 1:
             raise ValueError(
-                f"Expected depth_sequence.npy to have shape [T, H, W] or [T, 1, H, W], got "
+                f"Expected depth_sequence.npy to have shape [T, H, W], [T, 1, H, W], or "
+                f"[T, H, W, 1], got "
                 f"{tuple(depth_tensor.shape)} in {depth_path}."
             )
         if depth_tensor.shape[0] < self.num_frames:
