@@ -25,7 +25,6 @@ from sharp.training.dataset import (
     collate_view_pairs,
 )
 from sharp.training.losses import FineTuneLoss, FineTuneLossWeights
-from sharp.training.refinement import MaskDeltaRefiner
 from sharp.utils import io, vis
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import Gaussians3D, unproject_gaussians
@@ -79,24 +78,17 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--visualize-every", type=int, default=50, show_default=True)
 @click.option("--max-steps", type=int, default=0, show_default=True)
 @click.option("--preload-video/--stream-video", default=False, show_default=True)
-@click.option("--mask-guided/--no-mask-guided", default=False, show_default=True)
-@click.option(
-    "--refiner-update-covariance/--refiner-color-only",
-    default=False,
-    show_default=True,
-    help="Whether refiner updates covariance (scale/quaternion) in addition to color.",
-)
 @click.option("--perceptual/--no-perceptual", default=True, show_default=True)
-@click.option("--depth-loss/--no-depth-loss", default=False, show_default=True)
+@click.option("--depth-loss/--no-depth-loss", default=True, show_default=True)
 @click.option("--color-weight", type=float, default=1.0, show_default=True)
 @click.option("--alpha-weight", type=float, default=0.05, show_default=True)
 @click.option("--perceptual-weight", type=float, default=0.1, show_default=True)
-@click.option("--depth-tv-weight", type=float, default=0.0, show_default=True)
-@click.option("--grad-weight", type=float, default=0.0, show_default=True)
-@click.option("--delta-weight", type=float, default=0.0, show_default=True)
-@click.option("--splat-weight", type=float, default=0.0, show_default=True)
-@click.option("--scale-weight", type=float, default=0.0, show_default=True)
-@click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
+@click.option("--depth-tv-weight", type=float, default=0.01, show_default=True)
+@click.option("--grad-weight", type=float, default=0.01, show_default=True)
+@click.option("--delta-weight", type=float, default=0.01, show_default=True)
+@click.option("--splat-weight", type=float, default=0.01, show_default=True)
+@click.option("--scale-weight", type=float, default=0.01, show_default=True)
+@click.option("--scale-tv-weight", type=float, default=0.01, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def finetune_cli(
@@ -119,8 +111,6 @@ def finetune_cli(
     visualize_every: int,
     max_steps: int,
     preload_video: bool,
-    mask_guided: bool,
-    refiner_update_covariance: bool,
     perceptual: bool,
     depth_loss: bool,
     color_weight: float,
@@ -153,22 +143,11 @@ def finetune_cli(
     LOGGER.info("Using device %s", device_t)
 
     predictor = build_finetune_predictor(checkpoint_path).to(device_t)
-    refiner = MaskDeltaRefiner(
-        num_layers=predictor.init_model.num_layers,
-        update_covariance=refiner_update_covariance,
-    ).to(device_t)
-    refiner.requires_grad_(False)
     internal_resolution = (1536, 1536)
-    refiner_stride = predictor.init_model.stride
-    refiner_resolution = (
-        internal_resolution[0] // refiner_stride,
-        internal_resolution[1] // refiner_stride,
-    )
     if data_root is not None:
         dataset = MultiScenePosedVideoDataset(
             data_root=data_root,
             internal_resolution=internal_resolution,
-            refiner_resolution=refiner_resolution,
             min_frame_distance=min_frame_distance,
             max_frame_distance=max_frame_distance,
             samples_per_scene=samples_per_epoch,
@@ -180,7 +159,6 @@ def finetune_cli(
             video_path=video_path,
             pose_path=pose_path,
             internal_resolution=internal_resolution,
-            refiner_resolution=refiner_resolution,
             min_frame_distance=min_frame_distance,
             max_frame_distance=max_frame_distance,
             samples_per_epoch=samples_per_epoch,
@@ -217,23 +195,22 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names: list[str] = []
+    trainable_module_names = ["feature_model"]
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
-    ] + [
-        f"refiner.{name}" for name, param in refiner.named_parameters() if param.requires_grad
     ]
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
-    ) + sum(param.numel() for param in refiner.parameters() if param.requires_grad)
-    LOGGER.info("Optimizing modules: %s (%d parameters)", "none", trainable_parameter_count)
+    )
+    LOGGER.info(
+        "Optimizing modules: %s (%d parameters)",
+        ", ".join(trainable_module_names),
+        trainable_parameter_count,
+    )
     trainable_parameters = [
         param for _, param in predictor.named_parameters() if param.requires_grad
-    ] + [param for param in refiner.parameters() if param.requires_grad]
-    optimizer: torch.optim.Optimizer | None = None
-    if trainable_parameters:
-        optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
-    LOGGER.info("All parameter updates are disabled; running finetune loop in inference mode.")
+    ]
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     write_config(
         output_dir / "finetune_config.json",
@@ -252,9 +229,6 @@ def finetune_cli(
             "visualize_every": visualize_every,
             "low_pass_filter_eps": low_pass_filter_eps,
             "internal_resolution": list(internal_resolution),
-            "refiner_resolution": list(refiner_resolution),
-            "mask_guided": mask_guided,
-            "refiner_update_covariance": refiner_update_covariance,
             "grad_weight": grad_weight,
             "delta_weight": delta_weight,
             "splat_weight": splat_weight,
@@ -271,12 +245,11 @@ def finetune_cli(
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
 
+            optimizer.zero_grad(set_to_none=True)
             outputs = forward_training_pass(
                 predictor,
                 renderer,
                 batch,
-                refiner,
-                use_mask_guided_refinement=mask_guided,
             )
             losses = loss_module(
                 source_render=outputs["source_render"],
@@ -292,6 +265,9 @@ def finetune_cli(
             if epoch == 0 and global_step == 0:
                 LOGGER.info("Saving visualization at epoch=0 step=0 before optimization")
                 save_visualization_batch(visualization_dir, global_step, batch, outputs)
+
+            losses.total.backward()
+            optimizer.step()
 
             global_step += 1
             if global_step % log_every == 0:
@@ -323,7 +299,6 @@ def finetune_cli(
                 save_checkpoint(
                     output_dir / f"step_{global_step:06d}.pt",
                     predictor,
-                    refiner,
                     optimizer,
                     global_step,
                 )
@@ -333,7 +308,7 @@ def finetune_cli(
         if max_steps > 0 and global_step >= max_steps:
             break
 
-    save_checkpoint(output_dir / "last.pt", predictor, refiner, optimizer, global_step)
+    save_checkpoint(output_dir / "last.pt", predictor, optimizer, global_step)
 
 
 def resolve_device(device: str) -> torch.device:
@@ -348,11 +323,12 @@ def resolve_device(device: str) -> torch.device:
 
 
 def build_finetune_predictor(checkpoint_path: Path | None):
-    """Create SHARP predictor with all pretrained modules frozen."""
+    """Create SHARP predictor and train only gaussian decoder feature model."""
     params = PredictorParams()
     predictor = create_predictor(params)
     predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
     predictor.requires_grad_(False)
+    predictor.feature_model.requires_grad_(True)
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
@@ -395,17 +371,12 @@ def forward_training_pass(
     predictor,
     renderer: GSplatRenderer,
     batch: dict[str, torch.Tensor | None],
-    refiner: MaskDeltaRefiner,
-    use_mask_guided_refinement: bool,
 ) -> dict[str, torch.Tensor | RenderingOutputs | Gaussians3D]:
     """Run input-frame -> NDC Gaussians -> world-space -> target rendering."""
     source_image = batch["source_image"]
     source_depth = batch["source_depth"]
     disparity_factor = batch["disparity_factor"]
     source_intrinsics = batch["source_intrinsics"]
-    source_refiner_image = batch["source_refiner_image"]
-    source_refiner_intrinsics = batch["source_refiner_intrinsics"]
-    target_refiner_intrinsics = batch["target_refiner_intrinsics"]
     source_original_intrinsics = batch["source_original_intrinsics"]
     source_original_size = batch["source_original_size"]
     source_extrinsics = batch["source_extrinsics"]
@@ -417,13 +388,10 @@ def forward_training_pass(
     assert isinstance(source_image, torch.Tensor)
     assert isinstance(disparity_factor, torch.Tensor)
     assert isinstance(source_intrinsics, torch.Tensor)
-    assert isinstance(source_refiner_image, torch.Tensor)
-    assert isinstance(source_refiner_intrinsics, torch.Tensor)
     assert isinstance(source_original_intrinsics, torch.Tensor)
     assert isinstance(source_original_size, torch.Tensor)
     assert isinstance(source_extrinsics, torch.Tensor)
     assert isinstance(target_intrinsics, torch.Tensor)
-    assert isinstance(target_refiner_intrinsics, torch.Tensor)
     assert isinstance(target_original_intrinsics, torch.Tensor)
     assert isinstance(target_original_size, torch.Tensor)
     assert isinstance(target_extrinsics, torch.Tensor)
@@ -470,19 +438,6 @@ def forward_training_pass(
         image_width=source_image.shape[-1],
         image_height=source_image.shape[-2],
     )
-    target_refiner_render = renderer(
-        gaussians_world,
-        target_extrinsics,
-        target_refiner_intrinsics,
-        image_width=source_refiner_image.shape[-1],
-        image_height=source_refiner_image.shape[-2],
-    )
-
-    aligned_depth_refiner = F.avg_pool2d(
-        aligned_depth[:, 0:1],
-        kernel_size=predictor.init_model.stride,
-        stride=predictor.init_model.stride,
-    )
     invisible_mask = compute_target_invisible_mask(
         aligned_depth[:, 0:1],
         source_intrinsics,
@@ -490,55 +445,7 @@ def forward_training_pass(
         target_intrinsics,
         target_extrinsics,
     )
-    refiner_invisible_mask = compute_target_invisible_mask(
-        aligned_depth_refiner,
-        source_refiner_intrinsics,
-        source_extrinsics,
-        target_refiner_intrinsics,
-        target_extrinsics,
-    )
-    gaussian_invisible_gate = compute_gaussian_invisible_gate(
-        gaussians_world,
-        target_refiner_intrinsics,
-        target_extrinsics,
-        refiner_invisible_mask,
-        delta_values.shape[2],
-        delta_values.shape[-2],
-        delta_values.shape[-1],
-    )
-    invisible_target_render = target_refiner_render.color * refiner_invisible_mask
-    refinement_mask = refiner_invisible_mask
-    masked_target_refiner_input = invisible_target_render
-    if not use_mask_guided_refinement:
-        refinement_mask = torch.ones_like(refinement_mask)
-        masked_target_refiner_input = target_refiner_render.color
-
-    delta_correction = refiner(
-        source_refiner_image,
-        target_refiner_render.color,
-        masked_target_refiner_input,
-        refinement_mask,
-    )
-    if use_mask_guided_refinement:
-        delta_correction = delta_correction * gaussian_invisible_gate
-    refined_gaussians_ndc = predictor.gaussian_composer(
-        delta=delta_values + delta_correction,
-        base_values=init_output.gaussian_base_values,
-        global_scale=init_output.global_scale,
-    )
-    refined_gaussians_world = batch_unproject_gaussians(
-        refined_gaussians_ndc,
-        source_extrinsics,
-        source_intrinsics,
-        image_shape,
-    )
-    refined_target_render = renderer(
-        refined_gaussians_world,
-        target_extrinsics,
-        target_intrinsics,
-        image_width=source_image.shape[-1],
-        image_height=source_image.shape[-2],
-    )
+    invisible_target_render = target_render.color * invisible_mask
 
     source_render_original = render_batch_at_sizes(
         renderer,
@@ -549,7 +456,7 @@ def forward_training_pass(
     )
     refined_target_render_original = render_batch_at_sizes(
         renderer,
-        refined_gaussians_world,
+        gaussians_world,
         target_extrinsics,
         target_original_intrinsics,
         target_original_size,
@@ -557,10 +464,10 @@ def forward_training_pass(
 
     return {
         "gaussians_world": gaussians_world,
-        "refined_gaussians_world": refined_gaussians_world,
+        "refined_gaussians_world": gaussians_world,
         "source_render": source_render,
         "target_render": target_render,
-        "refined_target_render": refined_target_render,
+        "refined_target_render": target_render,
         "source_render_original": source_render_original,
         "refined_target_render_original": refined_target_render_original,
         "aligned_depth": aligned_depth,
@@ -813,7 +720,6 @@ def save_mask_image(mask: torch.Tensor, path: Path) -> None:
 def save_checkpoint(
     path: Path,
     predictor,
-    refiner,
     optimizer: torch.optim.Optimizer | None,
     global_step: int,
 ) -> None:
@@ -822,7 +728,6 @@ def save_checkpoint(
     torch.save(
         {
             "predictor": predictor.state_dict(),
-            "refiner": refiner.state_dict(),
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "global_step": global_step,
         },

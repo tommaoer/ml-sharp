@@ -76,6 +76,28 @@ class PosedVideoScene:
 
         self.intrinsics = self._create_intrinsics(metadata)
         self.frames = self._load_video_frames() if preload else None
+        self.depth_sequence = self._load_depth_sequence()
+
+    def _load_depth_sequence(self) -> torch.Tensor | None:
+        depth_path = self.video_path.parent / "depth_sequence.npy"
+        if not depth_path.exists():
+            return None
+
+        depth_np = np.load(depth_path)
+        depth_tensor = torch.from_numpy(depth_np).float()
+        if depth_tensor.ndim == 3:
+            depth_tensor = depth_tensor[:, None]
+        if depth_tensor.ndim != 4 or depth_tensor.shape[1] != 1:
+            raise ValueError(
+                f"Expected depth_sequence.npy to have shape [T, H, W] or [T, 1, H, W], got "
+                f"{tuple(depth_tensor.shape)} in {depth_path}."
+            )
+        if depth_tensor.shape[0] < self.num_frames:
+            raise ValueError(
+                f"Depth sequence {depth_path} has {depth_tensor.shape[0]} frames but pose json "
+                f"expects {self.num_frames}."
+            )
+        return depth_tensor[: self.num_frames]
 
     @staticmethod
     def _create_intrinsics(metadata: dict[str, Any]) -> torch.Tensor:
@@ -157,6 +179,14 @@ class PosedVideoScene:
             refiner_width,
             refiner_height,
         )
+        depth = None
+        if self.depth_sequence is not None:
+            depth = F.interpolate(
+                self.depth_sequence[frame_index : frame_index + 1],
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=True,
+            )[0]
         return FrameRecord(
             image=image,
             intrinsics=intrinsics,
@@ -166,6 +196,7 @@ class PosedVideoScene:
             original_intrinsics=self.intrinsics.clone(),
             extrinsics=torch.linalg.inv(self.c2ws[frame_index]),
             frame_index=frame_index,
+            depth=depth,
         )
 
 
@@ -338,8 +369,16 @@ def collate_view_pairs(batch: list[ViewPairSample]) -> dict[str, Any]:
         ),
         "source_extrinsics": torch.stack([item.source.extrinsics for item in batch], dim=0),
         "target_extrinsics": torch.stack([item.target.extrinsics for item in batch], dim=0),
-        "source_depth": None,
-        "target_depth": None,
+        "source_depth": (
+            torch.stack([item.source.depth for item in batch], dim=0)
+            if all(item.source.depth is not None for item in batch)
+            else None
+        ),
+        "target_depth": (
+            torch.stack([item.target.depth for item in batch], dim=0)
+            if all(item.target.depth is not None for item in batch)
+            else None
+        ),
         "disparity_factor": torch.stack([item.disparity_factor for item in batch], dim=0),
         "source_frame_index": torch.tensor([item.source.frame_index for item in batch]),
         "target_frame_index": torch.tensor([item.target.frame_index for item in batch]),
