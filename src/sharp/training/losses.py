@@ -242,7 +242,10 @@ class FineTuneLoss(nn.Module):
 
         perceptual = zero
         if self._enabled(self.weights.perceptual) and self.perceptual is not None:
-            perceptual = self.perceptual(target_render.color, target_image)
+            perceptual = self.perceptual(source_render.color, source_image) + self.perceptual(
+                target_render.color,
+                target_image,
+            )
 
         depth = zero
         if self._enabled(self.weights.depth) and isinstance(source_depth, torch.Tensor):
