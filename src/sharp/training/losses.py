@@ -201,6 +201,12 @@ class FineTuneLoss(nn.Module):
         )
         return penalty.mean()
 
+    @staticmethod
+    def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weighted = value * mask
+        denom = mask.sum().clamp(min=1.0)
+        return weighted.sum() / denom
+
     def forward(
         self,
         source_render: RenderingOutputs,
@@ -211,6 +217,7 @@ class FineTuneLoss(nn.Module):
         gaussians_ndc: Gaussians3D,
         gaussians_world: Gaussians3D,
         depth_alignment_map: torch.Tensor,
+        loss_region_mask: torch.Tensor | None = None,
     ) -> FineTuneLossOutputs:
         source_image = batch["source_image"]
         target_image = batch["target_image"]
@@ -222,29 +229,50 @@ class FineTuneLoss(nn.Module):
         assert isinstance(source_intrinsics, torch.Tensor)
 
         zero = source_image.new_tensor(0.0)
+        mask = loss_region_mask
+        if mask is None:
+            mask = torch.ones_like(source_image[:, 0:1])
+        mask = mask.to(dtype=source_image.dtype)
 
         color = zero
         if self._enabled(self.weights.color):
-            color = F.l1_loss(source_render.color, source_image) + F.l1_loss(
-                target_render.color,
-                target_image,
+            color = self._masked_mean(
+                torch.abs(source_render.color - source_image),
+                mask,
+            ) + self._masked_mean(
+                torch.abs(target_render.color - target_image),
+                mask,
             )
 
         alpha = zero
         if self._enabled(self.weights.alpha):
-            alpha = F.binary_cross_entropy(
+            source_alpha = F.binary_cross_entropy(
                 source_render.alpha.clamp(1e-6, 1 - 1e-6),
                 torch.ones_like(source_render.alpha),
-            ) + F.binary_cross_entropy(
+                reduction="none",
+            )
+            target_alpha = F.binary_cross_entropy(
                 target_render.alpha.clamp(1e-6, 1 - 1e-6),
                 torch.ones_like(target_render.alpha),
+                reduction="none",
+            )
+            alpha = self._masked_mean(
+                source_alpha,
+                mask,
+            ) + self._masked_mean(
+                target_alpha,
+                mask,
             )
 
         perceptual = zero
         if self._enabled(self.weights.perceptual) and self.perceptual is not None:
-            perceptual = self.perceptual(source_render.color, source_image) + self.perceptual(
-                target_render.color,
-                target_image,
+            source_masked_pred = source_render.color * mask
+            source_masked_gt = source_image * mask
+            target_masked_pred = target_render.color * mask
+            target_masked_gt = target_image * mask
+            perceptual = self.perceptual(source_masked_pred, source_masked_gt) + self.perceptual(
+                target_masked_pred,
+                target_masked_gt,
             )
 
         depth = zero

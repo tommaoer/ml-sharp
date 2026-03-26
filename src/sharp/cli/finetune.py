@@ -78,17 +78,18 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--visualize-every", type=int, default=50, show_default=True)
 @click.option("--max-steps", type=int, default=0, show_default=True)
 @click.option("--preload-video/--stream-video", default=False, show_default=True)
-@click.option("--perceptual/--no-perceptual", default=False, show_default=True)
-@click.option("--depth-loss/--no-depth-loss", default=True, show_default=True)
+@click.option("--perceptual/--no-perceptual", default=True, show_default=True)
+@click.option("--depth-loss/--no-depth-loss", default=False, show_default=True)
 @click.option("--color-weight", type=float, default=1.0, show_default=True)
 @click.option("--alpha-weight", type=float, default=0.05, show_default=True)
-@click.option("--perceptual-weight", type=float, default=0.0, show_default=True)
-@click.option("--depth-tv-weight", type=float, default=0.01, show_default=True)
-@click.option("--grad-weight", type=float, default=0.01, show_default=True)
-@click.option("--delta-weight", type=float, default=0.01, show_default=True)
+@click.option("--perceptual-weight", type=float, default=0.1, show_default=True)
+@click.option("--depth-tv-weight", type=float, default=0.0, show_default=True)
+@click.option("--grad-weight", type=float, default=0.0, show_default=True)
+@click.option("--delta-weight", type=float, default=0.0, show_default=True)
 @click.option("--splat-weight", type=float, default=0.0, show_default=True)
 @click.option("--scale-weight", type=float, default=0.0, show_default=True)
 @click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
+@click.option("--loss-border-ratio", type=float, default=0.15, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def finetune_cli(
@@ -122,6 +123,7 @@ def finetune_cli(
     splat_weight: float,
     scale_weight: float,
     scale_tv_weight: float,
+    loss_border_ratio: float,
     low_pass_filter_eps: float,
     verbose: bool,
 ) -> None:
@@ -185,12 +187,12 @@ def finetune_cli(
             alpha=alpha_weight,
             perceptual=perceptual_weight,
             depth=1.0 if depth_loss else 0.0,
-            depth_tv=depth_tv_weight,
-            grad=grad_weight,
-            delta=delta_weight,
-            splat=splat_weight,
-            scale=scale_weight,
-            scale_tv=scale_tv_weight,
+            depth_tv=0.0 if not depth_loss else depth_tv_weight,
+            grad=0.0 if not depth_loss else grad_weight,
+            delta=0.0 if not depth_loss else delta_weight,
+            splat=0.0 if not depth_loss else splat_weight,
+            scale=0.0 if not depth_loss else scale_weight,
+            scale_tv=0.0 if not depth_loss else scale_tv_weight,
         ),
         use_perceptual=perceptual,
     ).to(device_t)
@@ -229,6 +231,7 @@ def finetune_cli(
             "visualize_every": visualize_every,
             "low_pass_filter_eps": low_pass_filter_eps,
             "internal_resolution": list(internal_resolution),
+            "loss_border_ratio": loss_border_ratio,
             "grad_weight": grad_weight,
             "delta_weight": delta_weight,
             "splat_weight": splat_weight,
@@ -250,6 +253,7 @@ def finetune_cli(
                 predictor,
                 renderer,
                 batch,
+                loss_border_ratio=loss_border_ratio,
             )
             losses = loss_module(
                 source_render=outputs["source_render"],
@@ -260,6 +264,7 @@ def finetune_cli(
                 gaussians_ndc=outputs["gaussians_ndc"],
                 gaussians_world=outputs["gaussians_world"],
                 depth_alignment_map=outputs["depth_alignment_map"],
+                loss_region_mask=outputs["loss_region_mask"],
             )
 
             if epoch == 0 and global_step == 0:
@@ -371,6 +376,7 @@ def forward_training_pass(
     predictor,
     renderer: GSplatRenderer,
     batch: dict[str, torch.Tensor | None],
+    loss_border_ratio: float,
 ) -> dict[str, torch.Tensor | RenderingOutputs | Gaussians3D]:
     """Run input-frame -> NDC Gaussians -> world-space -> target rendering."""
     source_image = batch["source_image"]
@@ -446,6 +452,13 @@ def forward_training_pass(
         target_extrinsics,
     )
     invisible_target_render = target_render.color * invisible_mask
+    loss_region_mask = create_inner_region_mask(
+        batch_size=source_image.shape[0],
+        height=source_image.shape[-2],
+        width=source_image.shape[-1],
+        border_ratio=loss_border_ratio,
+        device=source_image.device,
+    )
 
     source_render_original = render_batch_at_sizes(
         renderer,
@@ -476,7 +489,24 @@ def forward_training_pass(
         "gaussians_ndc": gaussians_ndc,
         "invisible_mask": invisible_mask,
         "invisible_target_render": invisible_target_render,
+        "loss_region_mask": loss_region_mask,
     }
+
+
+def create_inner_region_mask(
+    batch_size: int,
+    height: int,
+    width: int,
+    border_ratio: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create a BCHW center-region mask by excluding border pixels."""
+    ratio = float(max(0.0, min(border_ratio, 0.45)))
+    border_h = int(round(height * ratio))
+    border_w = int(round(width * ratio))
+    mask = torch.zeros((batch_size, 1, height, width), device=device, dtype=torch.float32)
+    mask[:, :, border_h : height - border_h, border_w : width - border_w] = 1.0
+    return mask
 
 
 
@@ -669,6 +699,7 @@ def save_visualization_batch(
     refined_target_render_original = outputs["refined_target_render_original"]
     invisible_mask = outputs["invisible_mask"]
     invisible_target_render = outputs["invisible_target_render"]
+    loss_region_mask = outputs["loss_region_mask"]
     assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
     assert isinstance(refined_target_render, RenderingOutputs)
@@ -676,6 +707,7 @@ def save_visualization_batch(
     assert isinstance(refined_target_render_original, list)
     assert isinstance(invisible_mask, torch.Tensor)
     assert isinstance(invisible_target_render, torch.Tensor)
+    assert isinstance(loss_region_mask, torch.Tensor)
 
     prefix = output_dir / f"step_{global_step:06d}"
     save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.train.png"))
@@ -683,6 +715,7 @@ def save_visualization_batch(
     save_tensor_image(source_original_image[0], prefix.with_name(prefix.name + ".source.png"))
     save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
     save_mask_image(invisible_mask[0], prefix.with_name(prefix.name + ".invisible_mask.png"))
+    save_mask_image(loss_region_mask[0], prefix.with_name(prefix.name + ".loss_region_mask.png"))
     save_tensor_image(
         (invisible_target_render[0]).clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".invisible_target_render.png"),
