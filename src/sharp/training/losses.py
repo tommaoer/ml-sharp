@@ -201,12 +201,6 @@ class FineTuneLoss(nn.Module):
         )
         return penalty.mean()
 
-    @staticmethod
-    def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        weighted = value * mask
-        denom = mask.sum().clamp(min=1.0)
-        return weighted.sum() / denom
-
     def forward(
         self,
         source_render: RenderingOutputs,
@@ -233,46 +227,33 @@ class FineTuneLoss(nn.Module):
         if mask is None:
             mask = torch.ones_like(source_image[:, 0:1])
         mask = mask.to(dtype=source_image.dtype)
+        masked_source_render = source_render.color * mask
+        masked_source_image = source_image * mask
+        masked_target_render = target_render.color * mask
+        masked_target_image = target_image * mask
 
         color = zero
         if self._enabled(self.weights.color):
-            color = self._masked_mean(
-                torch.abs(source_render.color - source_image),
-                mask,
-            ) + self._masked_mean(
-                torch.abs(target_render.color - target_image),
-                mask,
+            color = F.l1_loss(masked_source_render, masked_source_image) + F.l1_loss(
+                masked_target_render,
+                masked_target_image,
             )
 
         alpha = zero
         if self._enabled(self.weights.alpha):
-            source_alpha = F.binary_cross_entropy(
-                source_render.alpha.clamp(1e-6, 1 - 1e-6),
-                torch.ones_like(source_render.alpha),
-                reduction="none",
-            )
-            target_alpha = F.binary_cross_entropy(
-                target_render.alpha.clamp(1e-6, 1 - 1e-6),
-                torch.ones_like(target_render.alpha),
-                reduction="none",
-            )
-            alpha = self._masked_mean(
-                source_alpha,
+            alpha = F.binary_cross_entropy(
+                source_render.alpha * mask,
                 mask,
-            ) + self._masked_mean(
-                target_alpha,
+            ) + F.binary_cross_entropy(
+                target_render.alpha * mask,
                 mask,
             )
 
         perceptual = zero
         if self._enabled(self.weights.perceptual) and self.perceptual is not None:
-            source_masked_pred = source_render.color * mask
-            source_masked_gt = source_image * mask
-            target_masked_pred = target_render.color * mask
-            target_masked_gt = target_image * mask
-            perceptual = self.perceptual(source_masked_pred, source_masked_gt) + self.perceptual(
-                target_masked_pred,
-                target_masked_gt,
+            perceptual = self.perceptual(masked_source_render, masked_source_image) + self.perceptual(
+                masked_target_render,
+                masked_target_image,
             )
 
         depth = zero
