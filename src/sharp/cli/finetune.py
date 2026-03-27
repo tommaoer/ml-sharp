@@ -459,6 +459,9 @@ def forward_training_pass(
         border_ratio=loss_border_ratio,
         device=source_image.device,
     )
+    # Only optimize target regions that are occluded from the source view and
+    # remain inside the user-specified central crop.
+    loss_region_mask = loss_region_mask * invisible_mask
 
     source_render_original = render_batch_at_sizes(
         renderer,
