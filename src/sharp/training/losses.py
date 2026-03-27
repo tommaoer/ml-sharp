@@ -227,34 +227,20 @@ class FineTuneLoss(nn.Module):
         if mask is None:
             mask = torch.ones_like(source_image[:, 0:1])
         mask = mask.to(dtype=source_image.dtype)
-        masked_source_render = source_render.color * mask
-        masked_source_image = source_image * mask
         masked_target_render = target_render.color * mask
         masked_target_image = target_image * mask
 
         color = zero
         if self._enabled(self.weights.color):
-            color = F.l1_loss(masked_source_render, masked_source_image) + F.l1_loss(
-                masked_target_render,
-                masked_target_image,
-            )
+            color = F.l1_loss(masked_target_render, masked_target_image)
 
         alpha = zero
         if self._enabled(self.weights.alpha):
-            alpha = F.binary_cross_entropy(
-                source_render.alpha * mask,
-                mask,
-            ) + F.binary_cross_entropy(
-                target_render.alpha * mask,
-                mask,
-            )
+            alpha = F.binary_cross_entropy(target_render.alpha * mask, mask)
 
         perceptual = zero
         if self._enabled(self.weights.perceptual) and self.perceptual is not None:
-            perceptual = self.perceptual(masked_source_render, masked_source_image) + self.perceptual(
-                masked_target_render,
-                masked_target_image,
-            )
+            perceptual = self.perceptual(masked_target_render, masked_target_image)
 
         depth = zero
         if self._enabled(self.weights.depth) and isinstance(source_depth, torch.Tensor):
