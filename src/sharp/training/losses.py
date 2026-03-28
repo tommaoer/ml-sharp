@@ -33,6 +33,7 @@ class FineTuneLossWeights:
     scale: float = 0.0
     scale_tv: float = 0.0
     keep: float = 0.0
+    target_global: float = 0.0
 
 
 class FineTuneLossOutputs(NamedTuple):
@@ -50,6 +51,7 @@ class FineTuneLossOutputs(NamedTuple):
     scale: torch.Tensor
     scale_tv: torch.Tensor
     keep: torch.Tensor
+    target_global: torch.Tensor
 
 
 class VGGPerceptualLoss(nn.Module):
@@ -249,6 +251,10 @@ class FineTuneLoss(nn.Module):
         if self._enabled(self.weights.keep):
             keep = F.l1_loss(target_render.color * outside_mask, source_render.color * outside_mask)
 
+        target_global = zero
+        if self._enabled(self.weights.target_global):
+            target_global = F.l1_loss(target_render.color, target_image)
+
         depth = zero
         if self._enabled(self.weights.depth) and isinstance(source_depth, torch.Tensor):
             predicted_disparity = self._inverse_depth(aligned_depth[:, 0:1])
@@ -291,6 +297,7 @@ class FineTuneLoss(nn.Module):
             + self.weights.scale * scale
             + self.weights.scale_tv * scale_tv
             + self.weights.keep * keep
+            + self.weights.target_global * target_global
         )
         return FineTuneLossOutputs(
             total=total,
@@ -305,4 +312,5 @@ class FineTuneLoss(nn.Module):
             scale=scale,
             scale_tv=scale_tv,
             keep=keep,
+            target_global=target_global,
         )

@@ -90,6 +90,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--scale-weight", type=float, default=0.0, show_default=True)
 @click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
 @click.option("--keep-weight", type=float, default=0.0, show_default=True)
+@click.option("--target-global-weight", type=float, default=0.1, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.15, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
@@ -125,6 +126,7 @@ def finetune_cli(
     scale_weight: float,
     scale_tv_weight: float,
     keep_weight: float,
+    target_global_weight: float,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
     verbose: bool,
@@ -196,6 +198,7 @@ def finetune_cli(
             scale=0.0 if not depth_loss else scale_weight,
             scale_tv=0.0 if not depth_loss else scale_tv_weight,
             keep=keep_weight,
+            target_global=target_global_weight,
         ),
         use_perceptual=perceptual,
     ).to(device_t)
@@ -241,6 +244,7 @@ def finetune_cli(
             "scale_weight": scale_weight,
             "scale_tv_weight": scale_tv_weight,
             "keep_weight": keep_weight,
+            "target_global_weight": target_global_weight,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
             "trainable_parameter_names": trainable_parameter_names,
@@ -284,7 +288,8 @@ def finetune_cli(
                     (
                         "epoch=%d step=%d total=%.4f color=%.4f alpha=%.4f "
                         "perceptual=%.4f depth=%.4f depth_tv=%.4f grad=%.4f "
-                        "delta=%.4f splat=%.4f scale=%.4f scale_tv=%.4f keep=%.4f"
+                        "delta=%.4f splat=%.4f scale=%.4f scale_tv=%.4f keep=%.4f "
+                        "target_global=%.4f"
                     ),
                     epoch,
                     global_step,
@@ -300,6 +305,7 @@ def finetune_cli(
                     losses.scale.item(),
                     losses.scale_tv.item(),
                     losses.keep.item(),
+                    losses.target_global.item(),
                 )
 
             if global_step % visualize_every == 0:
