@@ -91,6 +91,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
 @click.option("--keep-weight", type=float, default=0.0, show_default=True)
 @click.option("--target-global-weight", type=float, default=0.1, show_default=True)
+@click.option("--gaussian-mask-dilation-px", type=int, default=8, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.15, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
@@ -127,6 +128,7 @@ def finetune_cli(
     scale_tv_weight: float,
     keep_weight: float,
     target_global_weight: float,
+    gaussian_mask_dilation_px: int,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
     verbose: bool,
@@ -245,6 +247,7 @@ def finetune_cli(
             "scale_tv_weight": scale_tv_weight,
             "keep_weight": keep_weight,
             "target_global_weight": target_global_weight,
+            "gaussian_mask_dilation_px": gaussian_mask_dilation_px,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
             "trainable_parameter_names": trainable_parameter_names,
@@ -262,6 +265,7 @@ def finetune_cli(
                 renderer,
                 batch,
                 loss_border_ratio=loss_border_ratio,
+                gaussian_mask_dilation_px=gaussian_mask_dilation_px,
             )
             losses = loss_module(
                 source_render=outputs["source_render"],
@@ -388,6 +392,7 @@ def forward_training_pass(
     renderer: GSplatRenderer,
     batch: dict[str, torch.Tensor | None],
     loss_border_ratio: float,
+    gaussian_mask_dilation_px: int,
 ) -> dict[str, torch.Tensor | RenderingOutputs | Gaussians3D]:
     """Run input-frame -> NDC Gaussians -> world-space -> target rendering."""
     source_image = batch["source_image"]
@@ -458,11 +463,12 @@ def forward_training_pass(
     # Only optimize target regions that are occluded from the source view and
     # remain inside the user-specified central crop.
     loss_region_mask = loss_region_mask * invisible_mask
+    gaussian_gate_mask = dilate_binary_mask(loss_region_mask, dilation_px=gaussian_mask_dilation_px)
     gaussian_update_gate = compute_gaussian_invisible_gate(
         gaussians_world=gaussians_world,
         target_intrinsics=target_intrinsics,
         target_extrinsics=target_extrinsics,
-        region_mask=loss_region_mask,
+        region_mask=gaussian_gate_mask,
         num_layers=delta_values.shape[2],
         grid_height=delta_values.shape[-2],
         grid_width=delta_values.shape[-1],
@@ -525,6 +531,7 @@ def forward_training_pass(
         "invisible_mask": invisible_mask,
         "invisible_target_render": invisible_target_render,
         "loss_region_mask": loss_region_mask,
+        "gaussian_gate_mask": gaussian_gate_mask,
         "gaussian_update_gate": gaussian_update_gate,
     }
 
@@ -543,6 +550,14 @@ def create_inner_region_mask(
     mask = torch.zeros((batch_size, 1, height, width), device=device, dtype=torch.float32)
     mask[:, :, border_h : height - border_h, border_w : width - border_w] = 1.0
     return mask
+
+
+def dilate_binary_mask(mask: torch.Tensor, dilation_px: int) -> torch.Tensor:
+    """Dilate BCHW mask with a square kernel of radius `dilation_px`."""
+    if dilation_px <= 0:
+        return mask
+    kernel_size = 2 * dilation_px + 1
+    return F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=dilation_px)
 
 
 
@@ -736,6 +751,7 @@ def save_visualization_batch(
     invisible_mask = outputs["invisible_mask"]
     invisible_target_render = outputs["invisible_target_render"]
     loss_region_mask = outputs["loss_region_mask"]
+    gaussian_gate_mask = outputs["gaussian_gate_mask"]
     gaussian_update_gate = outputs["gaussian_update_gate"]
     assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
@@ -745,6 +761,7 @@ def save_visualization_batch(
     assert isinstance(invisible_mask, torch.Tensor)
     assert isinstance(invisible_target_render, torch.Tensor)
     assert isinstance(loss_region_mask, torch.Tensor)
+    assert isinstance(gaussian_gate_mask, torch.Tensor)
     assert isinstance(gaussian_update_gate, torch.Tensor)
 
     prefix = output_dir / f"step_{global_step:06d}"
@@ -754,6 +771,7 @@ def save_visualization_batch(
     save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
     save_mask_image(invisible_mask[0], prefix.with_name(prefix.name + ".invisible_mask.png"))
     save_mask_image(loss_region_mask[0], prefix.with_name(prefix.name + ".loss_region_mask.png"))
+    save_mask_image(gaussian_gate_mask[0], prefix.with_name(prefix.name + ".gaussian_gate_mask.png"))
     save_mask_image(
         gaussian_update_gate[0, :, 0].max(dim=0, keepdim=True).values,
         prefix.with_name(prefix.name + ".gaussian_update_gate.png"),
