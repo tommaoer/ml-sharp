@@ -89,7 +89,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--splat-weight", type=float, default=0.0, show_default=True)
 @click.option("--scale-weight", type=float, default=0.0, show_default=True)
 @click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
-@click.option("--keep-weight", type=float, default=0.5, show_default=True)
+@click.option("--keep-weight", type=float, default=0.0, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.15, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
@@ -435,6 +435,44 @@ def forward_training_pass(
         source_intrinsics,
         image_shape,
     )
+    invisible_mask = compute_target_invisible_mask(
+        aligned_depth[:, 0:1],
+        source_intrinsics,
+        source_extrinsics,
+        target_intrinsics,
+        target_extrinsics,
+    )
+    loss_region_mask = create_inner_region_mask(
+        batch_size=source_image.shape[0],
+        height=source_image.shape[-2],
+        width=source_image.shape[-1],
+        border_ratio=loss_border_ratio,
+        device=source_image.device,
+    )
+    # Only optimize target regions that are occluded from the source view and
+    # remain inside the user-specified central crop.
+    loss_region_mask = loss_region_mask * invisible_mask
+    gaussian_update_gate = compute_gaussian_invisible_gate(
+        gaussians_world=gaussians_world,
+        target_intrinsics=target_intrinsics,
+        target_extrinsics=target_extrinsics,
+        region_mask=loss_region_mask,
+        num_layers=delta_values.shape[2],
+        grid_height=delta_values.shape[-2],
+        grid_width=delta_values.shape[-1],
+    )
+    gated_delta_values = delta_values * gaussian_update_gate
+    gaussians_ndc = predictor.gaussian_composer(
+        delta=gated_delta_values,
+        base_values=init_output.gaussian_base_values,
+        global_scale=init_output.global_scale,
+    )
+    gaussians_world = batch_unproject_gaussians(
+        gaussians_ndc,
+        source_extrinsics,
+        source_intrinsics,
+        image_shape,
+    )
     source_render = renderer(
         gaussians_world,
         source_extrinsics,
@@ -449,24 +487,7 @@ def forward_training_pass(
         image_width=source_image.shape[-1],
         image_height=source_image.shape[-2],
     )
-    invisible_mask = compute_target_invisible_mask(
-        aligned_depth[:, 0:1],
-        source_intrinsics,
-        source_extrinsics,
-        target_intrinsics,
-        target_extrinsics,
-    )
     invisible_target_render = target_render.color * invisible_mask
-    loss_region_mask = create_inner_region_mask(
-        batch_size=source_image.shape[0],
-        height=source_image.shape[-2],
-        width=source_image.shape[-1],
-        border_ratio=loss_border_ratio,
-        device=source_image.device,
-    )
-    # Only optimize target regions that are occluded from the source view and
-    # remain inside the user-specified central crop.
-    loss_region_mask = loss_region_mask * invisible_mask
 
     source_render_original = render_batch_at_sizes(
         renderer,
@@ -493,11 +514,12 @@ def forward_training_pass(
         "refined_target_render_original": refined_target_render_original,
         "aligned_depth": aligned_depth,
         "depth_alignment_map": depth_alignment_map,
-        "delta_values": delta_values,
+        "delta_values": gated_delta_values,
         "gaussians_ndc": gaussians_ndc,
         "invisible_mask": invisible_mask,
         "invisible_target_render": invisible_target_render,
         "loss_region_mask": loss_region_mask,
+        "gaussian_update_gate": gaussian_update_gate,
     }
 
 
@@ -583,12 +605,12 @@ def compute_gaussian_invisible_gate(
     gaussians_world: Gaussians3D,
     target_intrinsics: torch.Tensor,
     target_extrinsics: torch.Tensor,
-    invisible_mask: torch.Tensor,
+    region_mask: torch.Tensor,
     num_layers: int,
     grid_height: int,
     grid_width: int,
 ) -> torch.Tensor:
-    """Gate updates to gaussians projected into target-invisible regions."""
+    """Gate updates to gaussians projected into a target-view mask region."""
     batch_size, num_gaussians, _ = gaussians_world.mean_vectors.shape
     means_world = torch.cat(
         [
@@ -606,11 +628,11 @@ def compute_gaussian_invisible_gate(
     v = target_intrinsics[:, 1, 1][:, None] * (means_target[..., 1] / z)
     v = v + target_intrinsics[:, 1, 2][:, None]
 
-    norm_u = 2.0 * (u / max(invisible_mask.shape[-1] - 1, 1)) - 1.0
-    norm_v = 2.0 * (v / max(invisible_mask.shape[-2] - 1, 1)) - 1.0
+    norm_u = 2.0 * (u / max(region_mask.shape[-1] - 1, 1)) - 1.0
+    norm_v = 2.0 * (v / max(region_mask.shape[-2] - 1, 1)) - 1.0
     grid = torch.stack([norm_u, norm_v], dim=-1).view(batch_size, num_gaussians, 1, 2)
     sampled_mask = F.grid_sample(
-        invisible_mask,
+        region_mask,
         grid,
         mode="bilinear",
         padding_mode="zeros",
@@ -708,6 +730,7 @@ def save_visualization_batch(
     invisible_mask = outputs["invisible_mask"]
     invisible_target_render = outputs["invisible_target_render"]
     loss_region_mask = outputs["loss_region_mask"]
+    gaussian_update_gate = outputs["gaussian_update_gate"]
     assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
     assert isinstance(refined_target_render, RenderingOutputs)
@@ -716,6 +739,7 @@ def save_visualization_batch(
     assert isinstance(invisible_mask, torch.Tensor)
     assert isinstance(invisible_target_render, torch.Tensor)
     assert isinstance(loss_region_mask, torch.Tensor)
+    assert isinstance(gaussian_update_gate, torch.Tensor)
 
     prefix = output_dir / f"step_{global_step:06d}"
     save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.train.png"))
@@ -724,6 +748,10 @@ def save_visualization_batch(
     save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
     save_mask_image(invisible_mask[0], prefix.with_name(prefix.name + ".invisible_mask.png"))
     save_mask_image(loss_region_mask[0], prefix.with_name(prefix.name + ".loss_region_mask.png"))
+    save_mask_image(
+        gaussian_update_gate[0, :, 0].max(dim=0, keepdim=True).values,
+        prefix.with_name(prefix.name + ".gaussian_update_gate.png"),
+    )
     save_tensor_image(
         (invisible_target_render[0]).clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".invisible_target_render.png"),
