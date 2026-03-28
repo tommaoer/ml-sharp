@@ -32,6 +32,7 @@ class FineTuneLossWeights:
     splat: float = 0.0
     scale: float = 0.0
     scale_tv: float = 0.0
+    keep: float = 0.0
 
 
 class FineTuneLossOutputs(NamedTuple):
@@ -48,6 +49,7 @@ class FineTuneLossOutputs(NamedTuple):
     splat: torch.Tensor
     scale: torch.Tensor
     scale_tv: torch.Tensor
+    keep: torch.Tensor
 
 
 class VGGPerceptualLoss(nn.Module):
@@ -229,6 +231,7 @@ class FineTuneLoss(nn.Module):
         mask = mask.to(dtype=source_image.dtype)
         masked_target_render = target_render.color * mask
         masked_target_image = target_image * mask
+        outside_mask = 1.0 - mask
 
         color = zero
         if self._enabled(self.weights.color):
@@ -241,6 +244,10 @@ class FineTuneLoss(nn.Module):
         perceptual = zero
         if self._enabled(self.weights.perceptual) and self.perceptual is not None:
             perceptual = self.perceptual(masked_target_render, masked_target_image)
+
+        keep = zero
+        if self._enabled(self.weights.keep):
+            keep = F.l1_loss(target_render.color * outside_mask, source_render.color * outside_mask)
 
         depth = zero
         if self._enabled(self.weights.depth) and isinstance(source_depth, torch.Tensor):
@@ -283,6 +290,7 @@ class FineTuneLoss(nn.Module):
             + self.weights.splat * splat
             + self.weights.scale * scale
             + self.weights.scale_tv * scale_tv
+            + self.weights.keep * keep
         )
         return FineTuneLossOutputs(
             total=total,
@@ -296,4 +304,5 @@ class FineTuneLoss(nn.Module):
             splat=splat,
             scale=scale,
             scale_tv=scale_tv,
+            keep=keep,
         )
