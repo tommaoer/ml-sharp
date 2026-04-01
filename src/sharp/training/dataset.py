@@ -78,29 +78,28 @@ class PosedVideoScene:
         self.frames = self._load_video_frames() if preload else None
         self.depth_sequence = self._load_depth_sequence()
 
-    def _load_depth_sequence(self) -> torch.Tensor | None:
+    def _load_depth_sequence(self) -> np.ndarray | None:
         depth_path = self.video_path.parent / "depth_sequence.npy"
         if not depth_path.exists():
             return None
 
-        depth_np = np.load(depth_path)
-        depth_tensor = torch.from_numpy(depth_np).float()
-        if depth_tensor.ndim == 3:
-            depth_tensor = depth_tensor[:, None]
-        elif depth_tensor.ndim == 4 and depth_tensor.shape[-1] == 1:
-            depth_tensor = depth_tensor.permute(0, 3, 1, 2)
-        if depth_tensor.ndim != 4 or depth_tensor.shape[1] != 1:
+        depth_np = np.load(depth_path, mmap_mode="r")
+        if depth_np.ndim == 3:
+            depth_np = depth_np[:, None, :, :]
+        elif depth_np.ndim == 4 and depth_np.shape[-1] == 1:
+            depth_np = np.transpose(depth_np, (0, 3, 1, 2))
+        if depth_np.ndim != 4 or depth_np.shape[1] != 1:
             raise ValueError(
                 f"Expected depth_sequence.npy to have shape [T, H, W], [T, 1, H, W], or "
                 f"[T, H, W, 1], got "
-                f"{tuple(depth_tensor.shape)} in {depth_path}."
+                f"{tuple(depth_np.shape)} in {depth_path}."
             )
-        if depth_tensor.shape[0] < self.num_frames:
+        if depth_np.shape[0] < self.num_frames:
             raise ValueError(
-                f"Depth sequence {depth_path} has {depth_tensor.shape[0]} frames but pose json "
+                f"Depth sequence {depth_path} has {depth_np.shape[0]} frames but pose json "
                 f"expects {self.num_frames}."
             )
-        return depth_tensor[: self.num_frames]
+        return depth_np[: self.num_frames]
 
     @staticmethod
     def _create_intrinsics(metadata: dict[str, Any]) -> torch.Tensor:
@@ -184,8 +183,11 @@ class PosedVideoScene:
         )
         depth = None
         if self.depth_sequence is not None:
+            depth_frame = torch.from_numpy(
+                np.array(self.depth_sequence[frame_index], copy=True)
+            ).float()[None]
             depth = F.interpolate(
-                self.depth_sequence[frame_index : frame_index + 1],
+                depth_frame,
                 size=(target_height, target_width),
                 mode="bilinear",
                 align_corners=True,
