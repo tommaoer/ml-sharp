@@ -631,7 +631,11 @@ def compute_gaussian_invisible_gate(
     grid_height: int,
     grid_width: int,
 ) -> torch.Tensor:
-    """Gate updates to gaussians projected into a target-view mask region."""
+    """Gate updates to gaussians projected into a target-view mask region.
+
+    The returned gate is binary (0/1): a Gaussian is trainable only when its
+    projected center falls inside `region_mask`.
+    """
     batch_size, num_gaussians, _ = gaussians_world.mean_vectors.shape
     means_world = torch.cat(
         [
@@ -655,10 +659,11 @@ def compute_gaussian_invisible_gate(
     sampled_mask = F.grid_sample(
         region_mask,
         grid,
-        mode="bilinear",
+        mode="nearest",
         padding_mode="zeros",
         align_corners=True,
     ).view(batch_size, num_gaussians)
+    sampled_mask = (sampled_mask > 0.5).float()
 
     valid = (means_target[..., 2] > 1e-4).float()
     sampled_mask = sampled_mask * valid
