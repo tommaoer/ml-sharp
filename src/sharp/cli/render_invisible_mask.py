@@ -19,7 +19,6 @@ from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
 from sharp.utils import camera
-from sharp.utils.gaussians import Gaussians3D
 from sharp.utils.gsplat import GSplatRenderer
 
 from .predict import DEFAULT_MODEL_URL, predict_image
@@ -50,7 +49,6 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--alpha-threshold", type=float, default=0.01, show_default=True)
 @click.option("--morph-radius", type=int, default=2, show_default=True)
 @click.option("--num-views", type=int, default=81, show_default=True)
-@click.option("--max-yaw-deg", type=float, default=50.0, show_default=True)
 @click.option("--save-video/--no-save-video", default=True, show_default=True)
 @click.option("--device", type=str, default="default", help="cuda / cpu / mps / default")
 @click.option("-v", "--verbose", is_flag=True)
@@ -62,7 +60,6 @@ def render_invisible_mask_cli(
     alpha_threshold: float,
     morph_radius: int,
     num_views: int,
-    max_yaw_deg: float,
     save_video: bool,
     device: str,
     verbose: bool,
@@ -85,12 +82,23 @@ def render_invisible_mask_cli(
     image, _, f_px = io.load_rgb(input_image)
     image_h, image_w = image.shape[:2]
     gaussians = predict_image(predictor, image, f_px, device_t)
-    intrinsics = build_intrinsics_from_image(f_px, image_w, image_h, device_t)
-    extrinsics = create_orbit_extrinsics(
-        gaussians=gaussians,
-        num_views=num_views,
-        max_yaw_deg=max_yaw_deg,
-        device=device_t,
+    intrinsics_cpu = build_intrinsics_from_image(f_px, image_w, image_h, torch.device("cpu"))
+    gaussians_cpu = gaussians.to(torch.device("cpu"))
+    camera_model = camera.create_camera_model(
+        gaussians_cpu,
+        intrinsics_cpu,
+        resolution_px=(image_w, image_h),
+    )
+    trajectory_params = camera.TrajectoryParams(
+        type="rotate_forward",
+        num_steps=num_views,
+        num_repeats=1,
+    )
+    trajectory = camera.create_eye_trajectory(
+        gaussians_cpu,
+        trajectory_params,
+        resolution_px=(image_w, image_h),
+        f_px=float(f_px),
     )
 
     renderer = GSplatRenderer(color_space="linearRGB", background_color="black").to(device_t)
@@ -99,13 +107,16 @@ def render_invisible_mask_cli(
         video_writer = iio.get_writer(output_dir / "invisible_mask.mp4", fps=fps)
 
     gaussians = gaussians.to(device_t)
-    for frame_index in range(extrinsics.shape[0]):
+    rendered_dir = output_dir / "rendered_color"
+    rendered_dir.mkdir(parents=True, exist_ok=True)
+    for frame_index, eye_position in enumerate(trajectory):
+        camera_info = camera_model.compute(eye_position)
         render_out = renderer(
             gaussians=gaussians,
-            extrinsics=extrinsics[frame_index : frame_index + 1],
-            intrinsics=intrinsics[None],
-            image_width=image_w,
-            image_height=image_h,
+            extrinsics=camera_info.extrinsics[None].to(device_t),
+            intrinsics=camera_info.intrinsics[None].to(device_t),
+            image_width=camera_info.width,
+            image_height=camera_info.height,
         )
         visible = render_out.alpha[0:1, 0:1]
         invisible_mask = (visible <= alpha_threshold).float()
@@ -113,9 +124,12 @@ def render_invisible_mask_cli(
 
         mask_np = (invisible_mask[0, 0] * 255.0).to(dtype=torch.uint8).detach().cpu().numpy()
         mask_rgb = np.repeat(mask_np[..., None], 3, axis=-1)
+        color_np = (render_out.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8).cpu().numpy()
         iio.imwrite(masks_dir / f"{frame_index:06d}.png", mask_rgb)
+        iio.imwrite(rendered_dir / f"{frame_index:06d}.png", color_np)
         if video_writer is not None:
-            video_writer.append_data(mask_rgb)
+            preview_frame = np.concatenate([color_np, mask_rgb], axis=1)
+            video_writer.append_data(preview_frame)
 
     if video_writer is not None:
         video_writer.close()
@@ -156,50 +170,6 @@ def build_intrinsics_from_image(f_px: float, width: int, height: int, device: to
         dtype=torch.float32,
         device=device,
     )
-
-
-def create_orbit_extrinsics(
-    gaussians: Gaussians3D,
-    num_views: int,
-    max_yaw_deg: float,
-    device: torch.device,
-) -> torch.Tensor:
-    """Create left-right arc trajectory, aligned with default SHARP render camera model."""
-    if num_views < 2:
-        raise ValueError("num_views must be >= 2.")
-    # Build trajectory on CPU because camera utilities instantiate some tensors on CPU.
-    scene = gaussians.to(torch.device("cpu"))
-    focal_px = float(800.0)
-    resolution_px = (1536, 1536)
-    intrinsics = torch.tensor(
-        [
-            [focal_px, 0.0, (resolution_px[0] - 1) / 2.0, 0.0],
-            [0.0, focal_px, (resolution_px[1] - 1) / 2.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-    )
-    camera_model = camera.create_camera_model(scene, intrinsics, resolution_px=resolution_px)
-    traj_params = camera.TrajectoryParams(type="rotate_forward", num_steps=num_views)
-    max_offset_xyz = camera.compute_max_offset(scene, traj_params, resolution_px, focal_px)
-    arc_radius = float(max(max_offset_xyz[0], 1e-4))
-
-    yaw_values = torch.linspace(-max_yaw_deg, max_yaw_deg, num_views, device=torch.device("cpu"))
-    extrinsics = []
-    for yaw_deg in yaw_values:
-        yaw = torch.deg2rad(yaw_deg)
-        eye = torch.stack(
-            [
-                arc_radius * torch.sin(yaw),
-                torch.tensor(0.0, dtype=torch.float32),
-                arc_radius * (1.0 - torch.cos(yaw)),
-            ]
-        )
-        extrinsics.append(camera_model.compute(eye).extrinsics)
-    return torch.stack(extrinsics, dim=0).to(device)
-
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
     """Apply light closing+opening on a BCHW binary mask."""
