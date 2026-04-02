@@ -189,34 +189,23 @@ def build_intrinsics_from_image(f_px: float, width: int, height: int, device: to
     )
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """Apply stronger morphology to smooth edges and remove isolated outliers."""
+    """Remove isolated outliers first, then smooth/regularize mask boundaries."""
     if radius <= 0:
         return (mask > 0.5).float()
     binary = (mask > 0.5).float()
+    # 1) Drop isolated single-pixel outliers aggressively.
+    local_count = F.avg_pool2d(binary, kernel_size=3, stride=1, padding=1) * 9.0
+    cleaned = binary * (local_count >= 3.0).float()
+
+    # 2) Remove tiny islands by requiring wider neighborhood support.
+    island_support = F.avg_pool2d(cleaned, kernel_size=7, stride=1, padding=3) * 49.0
+    cleaned = cleaned * (island_support >= 14.0).float()
+
+    # 3) Smooth edges with local voting, then close/open once for regular boundaries.
+    smoothed = (F.avg_pool2d(cleaned, kernel_size=5, stride=1, padding=2) > 0.5).float()
     kernel = 2 * radius + 1
-    # Strong closing/opening to merge nearby fragments and remove speckles.
-    dilated = F.max_pool2d(binary, kernel_size=kernel, stride=1, padding=radius)
+    dilated = F.max_pool2d(smoothed, kernel_size=kernel, stride=1, padding=radius)
     closed = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=kernel, stride=1, padding=radius)
     eroded = 1.0 - F.max_pool2d(1.0 - closed, kernel_size=kernel, stride=1, padding=radius)
     opened = F.max_pool2d(eroded, kernel_size=kernel, stride=1, padding=radius)
-
-    # Edge smoothing via stronger local voting.
-    voted = (F.avg_pool2d(opened, kernel_size=5, stride=1, padding=2) > 0.52).float()
-
-    # Remove isolated points / tiny islands with stricter support.
-    support = F.avg_pool2d(voted, kernel_size=7, stride=1, padding=3) * 49.0
-    cleaned = voted * (support >= 20.0).float()
-
-    # Fill tiny black holes inside large white regions.
-    inverted = 1.0 - cleaned
-    hole_support = F.avg_pool2d(inverted, kernel_size=5, stride=1, padding=2) * 25.0
-    inverted = inverted * (hole_support >= 10.0).float()
-    cleaned = 1.0 - inverted
-
-    # Final boundary smoothing.
-    final_dilate = F.max_pool2d(cleaned, kernel_size=kernel, stride=1, padding=radius)
-    final_closed = 1.0 - F.max_pool2d(
-        1.0 - final_dilate, kernel_size=kernel, stride=1, padding=radius
-    )
-    final_vote = F.avg_pool2d(final_closed, kernel_size=3, stride=1, padding=1)
-    return (final_vote > 0.5).float()
+    return (opened > 0.5).float()
