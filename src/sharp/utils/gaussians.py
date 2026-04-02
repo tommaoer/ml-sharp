@@ -154,15 +154,15 @@ def decompose_covariance_matrices(
 
     # NOTE: in SVD, it is possible that U and VT are both reflections.
     # We need to correct them.
-    batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
-    num_reflections = len(gaussian_idx)
+    reflection_mask = torch.linalg.det(rotations) < 0
+    num_reflections = int(reflection_mask.sum().item())
     if num_reflections > 0:
         LOGGER.warning(
             "Received %d reflection matrices from SVD. Flipping them to rotations.",
             num_reflections,
         )
         # Flip the last column of reflection and make it a rotation.
-        rotations[batch_idx, gaussian_idx, :, -1] *= -1
+        rotations[reflection_mask, :, -1] *= -1
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
