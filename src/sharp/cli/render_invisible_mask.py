@@ -6,7 +6,6 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
@@ -19,6 +18,8 @@ import torch.nn.functional as F
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
+from sharp.utils.camera import create_camera_matrix
+from sharp.utils.gaussians import Gaussians3D
 from sharp.utils.gsplat import GSplatRenderer
 
 from .predict import DEFAULT_MODEL_URL, predict_image
@@ -32,12 +33,6 @@ LOGGER = logging.getLogger(__name__)
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
     help="Path to a single input image for SHARP inference.",
-)
-@click.option(
-    "--camera-path",
-    type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    required=True,
-    help="Path to camera json with fl_x/fl_y/cx/cy/c2ws.",
 )
 @click.option(
     "--output-dir",
@@ -54,17 +49,20 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--fps", type=float, default=30.0, show_default=True)
 @click.option("--alpha-threshold", type=float, default=0.01, show_default=True)
 @click.option("--morph-radius", type=int, default=2, show_default=True)
+@click.option("--num-views", type=int, default=81, show_default=True)
+@click.option("--max-yaw-deg", type=float, default=50.0, show_default=True)
 @click.option("--save-video/--no-save-video", default=True, show_default=True)
 @click.option("--device", type=str, default="default", help="cuda / cpu / mps / default")
 @click.option("-v", "--verbose", is_flag=True)
 def render_invisible_mask_cli(
     input_image: Path,
-    camera_path: Path,
     output_dir: Path,
     checkpoint_path: Path | None,
     fps: float,
     alpha_threshold: float,
     morph_radius: int,
+    num_views: int,
+    max_yaw_deg: float,
     save_video: bool,
     device: str,
     verbose: bool,
@@ -87,13 +85,13 @@ def render_invisible_mask_cli(
     image, _, f_px = io.load_rgb(input_image)
     image_h, image_w = image.shape[:2]
     gaussians = predict_image(predictor, image, f_px, device_t)
-
-    camera_payload = json.loads(camera_path.read_text(encoding="utf-8"))
-    intrinsics = build_intrinsics(camera_payload, image_w, image_h, device_t)
-    c2ws = torch.tensor(camera_payload["c2ws"], dtype=torch.float32, device=device_t)
-    if c2ws.ndim != 3 or c2ws.shape[-2:] != (4, 4):
-        raise ValueError(f"Expected c2ws shape [T, 4, 4], got {tuple(c2ws.shape)}.")
-    extrinsics = torch.linalg.inv(c2ws)
+    intrinsics = build_intrinsics_from_image(f_px, image_w, image_h, device_t)
+    extrinsics = create_orbit_extrinsics(
+        gaussians=gaussians,
+        num_views=num_views,
+        max_yaw_deg=max_yaw_deg,
+        device=device_t,
+    )
 
     renderer = GSplatRenderer(color_space="linearRGB", background_color="black").to(device_t)
     video_writer = None
@@ -142,14 +140,12 @@ def load_weights(checkpoint_path: Path | None) -> dict[str, torch.Tensor]:
     return checkpoint
 
 
-def build_intrinsics(
-    payload: dict[str, object], width: int, height: int, device: torch.device
-) -> torch.Tensor:
-    """Build OpenCV-style 4x4 intrinsics from json payload."""
-    fx = float(payload["fl_x"])
-    fy = float(payload.get("fl_y", payload["fl_x"]))
-    cx = float(payload.get("cx", (width - 1) / 2.0))
-    cy = float(payload.get("cy", (height - 1) / 2.0))
+def build_intrinsics_from_image(f_px: float, width: int, height: int, device: torch.device) -> torch.Tensor:
+    """Build OpenCV-style 4x4 intrinsics from the input image camera."""
+    fx = float(f_px)
+    fy = float(f_px)
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
     return torch.tensor(
         [
             [fx, 0.0, cx, 0.0],
@@ -160,6 +156,55 @@ def build_intrinsics(
         dtype=torch.float32,
         device=device,
     )
+
+
+def create_orbit_extrinsics(
+    gaussians: Gaussians3D,
+    num_views: int,
+    max_yaw_deg: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create left-right orbit around scene centroid with vertical Y-axis."""
+    if num_views < 2:
+        raise ValueError("num_views must be >= 2.")
+    means = gaussians.mean_vectors[0].to(device)
+    opacities = gaussians.opacities[0].flatten().to(device)
+    weights = opacities / opacities.sum().clamp(min=1e-6)
+    center = (means * weights[:, None]).sum(dim=0)
+
+    camera_origin = torch.zeros(3, dtype=torch.float32, device=device)
+    rel = camera_origin - center
+    xz_radius = torch.linalg.norm(rel[[0, 2]])
+    if xz_radius < 1e-3:
+        xz_std = means[:, [0, 2]].std(dim=0).mean().clamp(min=0.5)
+        rel = torch.tensor([xz_std, rel[1], 0.0], device=device)
+
+    yaw_values = torch.linspace(-max_yaw_deg, max_yaw_deg, num_views, device=device)
+    extrinsics = []
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+    for yaw_deg in yaw_values:
+        yaw = torch.deg2rad(yaw_deg)
+        cos_v = torch.cos(yaw)
+        sin_v = torch.sin(yaw)
+        rot_y = torch.tensor(
+            [
+                [cos_v, 0.0, sin_v],
+                [0.0, 1.0, 0.0],
+                [-sin_v, 0.0, cos_v],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        eye = center + rot_y @ rel
+        extrinsics.append(
+            create_camera_matrix(
+                position=eye,
+                look_at_position=center,
+                world_up=world_up,
+                inverse=True,
+            )
+        )
+    return torch.stack(extrinsics, dim=0)
 
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
