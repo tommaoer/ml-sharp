@@ -189,20 +189,20 @@ def build_intrinsics_from_image(f_px: float, width: int, height: int, device: to
     )
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """Remove isolated outliers first, then smooth/regularize mask boundaries."""
+    """Remove isolated black holes and smooth black/white boundaries."""
     if radius <= 0:
         return (mask > 0.5).float()
     binary = (mask > 0.5).float()
-    # 1) Drop isolated single-pixel outliers aggressively.
-    local_count = F.avg_pool2d(binary, kernel_size=3, stride=1, padding=1) * 9.0
-    cleaned = binary * (local_count >= 3.0).float()
+    # 1) Remove isolated black points/holes inside white regions.
+    black = 1.0 - binary
+    black_support = F.avg_pool2d(black, kernel_size=3, stride=1, padding=1) * 9.0
+    black = black * (black_support >= 4.0).float()
+    filled = 1.0 - black
 
-    # 2) Remove tiny islands by requiring wider neighborhood support.
-    island_support = F.avg_pool2d(cleaned, kernel_size=7, stride=1, padding=3) * 49.0
-    cleaned = cleaned * (island_support >= 14.0).float()
+    # 2) Smooth boundary with local voting.
+    smoothed = (F.avg_pool2d(filled, kernel_size=5, stride=1, padding=2) > 0.5).float()
 
-    # 3) Smooth edges with local voting, then close/open once for regular boundaries.
-    smoothed = (F.avg_pool2d(cleaned, kernel_size=5, stride=1, padding=2) > 0.5).float()
+    # 3) One close/open round to regularize contour.
     kernel = 2 * radius + 1
     dilated = F.max_pool2d(smoothed, kernel_size=kernel, stride=1, padding=radius)
     closed = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=kernel, stride=1, padding=radius)
