@@ -14,6 +14,7 @@ import click
 import imageio.v2 as iio
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
@@ -52,6 +53,7 @@ LOGGER = logging.getLogger(__name__)
 )
 @click.option("--fps", type=float, default=30.0, show_default=True)
 @click.option("--alpha-threshold", type=float, default=0.01, show_default=True)
+@click.option("--morph-radius", type=int, default=2, show_default=True)
 @click.option("--save-video/--no-save-video", default=True, show_default=True)
 @click.option("--device", type=str, default="default", help="cuda / cpu / mps / default")
 @click.option("-v", "--verbose", is_flag=True)
@@ -62,6 +64,7 @@ def render_invisible_mask_cli(
     checkpoint_path: Path | None,
     fps: float,
     alpha_threshold: float,
+    morph_radius: int,
     save_video: bool,
     device: str,
     verbose: bool,
@@ -75,6 +78,8 @@ def render_invisible_mask_cli(
     output_dir.mkdir(parents=True, exist_ok=True)
     masks_dir = output_dir / "masks"
     masks_dir.mkdir(parents=True, exist_ok=True)
+    invisible_render_dir = output_dir / "invisible_target_render"
+    invisible_render_dir.mkdir(parents=True, exist_ok=True)
 
     state_dict = load_weights(checkpoint_path)
     predictor = create_predictor(PredictorParams()).to(device_t)
@@ -106,13 +111,19 @@ def render_invisible_mask_cli(
             image_width=image_w,
             image_height=image_h,
         )
-        visible = render_out.alpha[0, 0]
-        invisible_mask = (visible <= alpha_threshold).to(dtype=torch.uint8) * 255
-        mask_np = invisible_mask.detach().cpu().numpy()
+        visible = render_out.alpha[0:1, 0:1]
+        invisible_mask = (visible <= alpha_threshold).float()
+        invisible_mask = apply_morphology(invisible_mask, morph_radius)
+        invisible_target_render = (render_out.color[0] * invisible_mask[0]).clamp(0.0, 1.0)
+
+        mask_np = (invisible_mask[0, 0] * 255.0).to(dtype=torch.uint8).detach().cpu().numpy()
         mask_rgb = np.repeat(mask_np[..., None], 3, axis=-1)
+        invisible_render_np = (invisible_target_render.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+        invisible_render_np = invisible_render_np.detach().cpu().numpy()
         iio.imwrite(masks_dir / f"{frame_index:06d}.png", mask_rgb)
+        iio.imwrite(invisible_render_dir / f"{frame_index:06d}.png", invisible_render_np)
         if video_writer is not None:
-            video_writer.append_data(mask_rgb)
+            video_writer.append_data(invisible_render_np)
 
     if video_writer is not None:
         video_writer.close()
@@ -156,3 +167,16 @@ def build_intrinsics(
         device=device,
     )
 
+
+def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Apply light closing+opening on a BCHW binary mask."""
+    if radius <= 0:
+        return mask
+    kernel = 2 * radius + 1
+    # Closing: dilate then erode.
+    dilated = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=radius)
+    closed = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=kernel, stride=1, padding=radius)
+    # Opening: erode then dilate.
+    eroded = 1.0 - F.max_pool2d(1.0 - closed, kernel_size=kernel, stride=1, padding=radius)
+    opened = F.max_pool2d(eroded, kernel_size=kernel, stride=1, padding=radius)
+    return (opened > 0.5).float()
