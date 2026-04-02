@@ -226,9 +226,10 @@ def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
             dist_in = ndi.distance_transform_edt(binary)
             dist_out = ndi.distance_transform_edt(~binary)
             sdf = dist_in - dist_out
-            sdf = ndi.gaussian_filter(sdf.astype(np.float32), sigma=max(1.2, safe_radius * 0.8))
-            binary = sdf > 0.0
-            binary = ndi.binary_closing(binary, structure=np.ones((5, 5), dtype=bool))
+            sdf = ndi.gaussian_filter(sdf.astype(np.float32), sigma=max(1.8, safe_radius * 1.0))
+            binary = sdf > -0.2
+            binary = ndi.binary_closing(binary, structure=np.ones((7, 7), dtype=bool))
+            binary = ndi.binary_fill_holes(binary)
 
             # Safety guard: avoid over-suppressing to all-black/all-white.
             original_ratio = float(original.mean())
