@@ -223,9 +223,10 @@ def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
             binary = ndi.binary_dilation(binary, structure=np.ones((3, 3), dtype=bool))
 
             # Final edge smoothing with Gaussian + threshold.
-            smoothed = ndi.gaussian_filter(binary.astype(np.float32), sigma=max(0.8, safe_radius * 0.45))
-            binary = smoothed > 0.5
-            binary = ndi.binary_closing(binary, structure=np.ones((3, 3), dtype=bool))
+            smoothed = ndi.gaussian_filter(binary.astype(np.float32), sigma=max(1.1, safe_radius * 0.6))
+            binary = smoothed > 0.48
+            binary = ndi.binary_closing(binary, structure=np.ones((5, 5), dtype=bool))
+            binary = ndi.binary_opening(binary, structure=np.ones((3, 3), dtype=bool))
 
             # Safety guard: avoid over-suppressing to all-black/all-white.
             original_ratio = float(original.mean())
