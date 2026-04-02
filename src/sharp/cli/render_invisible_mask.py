@@ -189,20 +189,22 @@ def build_intrinsics_from_image(f_px: float, width: int, height: int, device: to
     )
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """Use mature image morphology to smooth boundaries and remove outlier speckles."""
+    """Use conservative morphology to smooth boundaries without collapsing the mask."""
     if radius <= 0:
         return (mask > 0.5).float()
     mask_np = (mask.detach().cpu().numpy() > 0.5)
-    structure = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
-    min_component_area = max(8, radius * radius * 2)
+    safe_radius = int(max(1, min(radius, 3)))
+    structure = np.ones((2 * safe_radius + 1, 2 * safe_radius + 1), dtype=bool)
+    min_component_area = max(4, safe_radius * safe_radius)
     processed = np.zeros_like(mask_np, dtype=np.float32)
 
     for batch_index in range(mask_np.shape[0]):
         for channel_index in range(mask_np.shape[1]):
-            binary = mask_np[batch_index, channel_index]
-            # Smooth and regularize contour.
-            binary = ndi.binary_opening(binary, structure=structure)
+            original = mask_np[batch_index, channel_index]
+            binary = original.copy()
+            # Conservative contour regularization.
             binary = ndi.binary_closing(binary, structure=structure)
+            binary = ndi.binary_opening(binary, structure=structure)
 
             # Remove small white speckles/islands.
             labels, num_labels = ndi.label(binary)
@@ -212,17 +214,18 @@ def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
                 keep[0] = False
                 binary = keep[labels]
 
-            # Fill tiny black holes (isolated black dots).
-            inv_labels, inv_num_labels = ndi.label(~binary)
-            if inv_num_labels > 0:
-                inv_counts = np.bincount(inv_labels.ravel())
-                hole_keep = inv_counts >= min_component_area
-                hole_keep[0] = True
-                binary = ~(hole_keep[inv_labels])
+            # Fill small interior holes.
+            binary = ndi.binary_fill_holes(binary)
 
             # Final edge smoothing with Gaussian + threshold.
-            smoothed = ndi.gaussian_filter(binary.astype(np.float32), sigma=max(0.8, radius * 0.5))
-            binary = smoothed > 0.5
+            smoothed = ndi.gaussian_filter(binary.astype(np.float32), sigma=max(0.6, safe_radius * 0.35))
+            binary = smoothed > 0.55
+
+            # Safety guard: avoid over-suppressing to all-black/all-white.
+            original_ratio = float(original.mean())
+            new_ratio = float(binary.mean())
+            if original_ratio > 1e-4 and (new_ratio < 0.25 * original_ratio or new_ratio > 4.0 * original_ratio):
+                binary = original
             processed[batch_index, channel_index] = binary.astype(np.float32)
 
     return torch.from_numpy(processed).to(mask.device)
