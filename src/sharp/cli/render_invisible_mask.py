@@ -78,8 +78,6 @@ def render_invisible_mask_cli(
     output_dir.mkdir(parents=True, exist_ok=True)
     masks_dir = output_dir / "masks"
     masks_dir.mkdir(parents=True, exist_ok=True)
-    invisible_render_dir = output_dir / "invisible_target_render"
-    invisible_render_dir.mkdir(parents=True, exist_ok=True)
 
     state_dict = load_weights(checkpoint_path)
     predictor = create_predictor(PredictorParams()).to(device_t)
@@ -114,16 +112,12 @@ def render_invisible_mask_cli(
         visible = render_out.alpha[0:1, 0:1]
         invisible_mask = (visible <= alpha_threshold).float()
         invisible_mask = apply_morphology(invisible_mask, morph_radius)
-        invisible_target_render = (render_out.color[0] * invisible_mask[0]).clamp(0.0, 1.0)
 
         mask_np = (invisible_mask[0, 0] * 255.0).to(dtype=torch.uint8).detach().cpu().numpy()
         mask_rgb = np.repeat(mask_np[..., None], 3, axis=-1)
-        invisible_render_np = (invisible_target_render.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
-        invisible_render_np = invisible_render_np.detach().cpu().numpy()
         iio.imwrite(masks_dir / f"{frame_index:06d}.png", mask_rgb)
-        iio.imwrite(invisible_render_dir / f"{frame_index:06d}.png", invisible_render_np)
         if video_writer is not None:
-            video_writer.append_data(invisible_render_np)
+            video_writer.append_data(mask_rgb)
 
     if video_writer is not None:
         video_writer.close()
