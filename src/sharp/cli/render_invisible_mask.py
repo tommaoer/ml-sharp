@@ -217,9 +217,14 @@ def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
             # Fill small interior holes.
             binary = ndi.binary_fill_holes(binary)
 
+            # Encourage larger connected regions by bridging narrow gaps.
+            bridge_structure = np.ones((2 * safe_radius + 3, 2 * safe_radius + 3), dtype=bool)
+            binary = ndi.binary_closing(binary, structure=bridge_structure)
+            binary = ndi.binary_dilation(binary, structure=np.ones((3, 3), dtype=bool))
+
             # Final edge smoothing with Gaussian + threshold.
             smoothed = ndi.gaussian_filter(binary.astype(np.float32), sigma=max(0.6, safe_radius * 0.35))
-            binary = smoothed > 0.55
+            binary = smoothed > 0.52
 
             # Safety guard: avoid over-suppressing to all-black/all-white.
             original_ratio = float(original.mean())
