@@ -167,7 +167,8 @@ def create_orbit_extrinsics(
     """Create left-right arc trajectory, aligned with default SHARP render camera model."""
     if num_views < 2:
         raise ValueError("num_views must be >= 2.")
-    scene = gaussians.to(device)
+    # Build trajectory on CPU because camera utilities instantiate some tensors on CPU.
+    scene = gaussians.to(torch.device("cpu"))
     focal_px = float(800.0)
     resolution_px = (1536, 1536)
     intrinsics = torch.tensor(
@@ -178,26 +179,26 @@ def create_orbit_extrinsics(
             [0.0, 0.0, 0.0, 1.0],
         ],
         dtype=torch.float32,
-        device=device,
+        device=torch.device("cpu"),
     )
     camera_model = camera.create_camera_model(scene, intrinsics, resolution_px=resolution_px)
     traj_params = camera.TrajectoryParams(type="rotate_forward", num_steps=num_views)
     max_offset_xyz = camera.compute_max_offset(scene, traj_params, resolution_px, focal_px)
     arc_radius = float(max(max_offset_xyz[0], 1e-4))
 
-    yaw_values = torch.linspace(-max_yaw_deg, max_yaw_deg, num_views, device=device)
+    yaw_values = torch.linspace(-max_yaw_deg, max_yaw_deg, num_views, device=torch.device("cpu"))
     extrinsics = []
     for yaw_deg in yaw_values:
         yaw = torch.deg2rad(yaw_deg)
         eye = torch.stack(
             [
                 arc_radius * torch.sin(yaw),
-                torch.tensor(0.0, dtype=torch.float32, device=device),
+                torch.tensor(0.0, dtype=torch.float32),
                 arc_radius * (1.0 - torch.cos(yaw)),
             ]
         )
-        extrinsics.append(camera_model.compute(eye).extrinsics.to(device))
-    return torch.stack(extrinsics, dim=0)
+        extrinsics.append(camera_model.compute(eye).extrinsics)
+    return torch.stack(extrinsics, dim=0).to(device)
 
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
