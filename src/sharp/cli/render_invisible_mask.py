@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
-from sharp.utils.camera import create_camera_matrix
+from sharp.utils import camera
 from sharp.utils.gaussians import Gaussians3D
 from sharp.utils.gsplat import GSplatRenderer
 
@@ -164,46 +164,39 @@ def create_orbit_extrinsics(
     max_yaw_deg: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """Create left-right orbit around scene centroid with vertical Y-axis."""
+    """Create left-right arc trajectory, aligned with default SHARP render camera model."""
     if num_views < 2:
         raise ValueError("num_views must be >= 2.")
-    means = gaussians.mean_vectors[0].to(device)
-    opacities = gaussians.opacities[0].flatten().to(device)
-    weights = opacities / opacities.sum().clamp(min=1e-6)
-    center = (means * weights[:, None]).sum(dim=0)
-
-    camera_origin = torch.zeros(3, dtype=torch.float32, device=device)
-    rel = camera_origin - center
-    xz_radius = torch.linalg.norm(rel[[0, 2]])
-    if xz_radius < 1e-3:
-        xz_std = means[:, [0, 2]].std(dim=0).mean().clamp(min=0.5)
-        rel = torch.tensor([xz_std, rel[1], 0.0], device=device)
+    scene = gaussians.to(device)
+    focal_px = float(800.0)
+    resolution_px = (1536, 1536)
+    intrinsics = torch.tensor(
+        [
+            [focal_px, 0.0, (resolution_px[0] - 1) / 2.0, 0.0],
+            [0.0, focal_px, (resolution_px[1] - 1) / 2.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    camera_model = camera.create_camera_model(scene, intrinsics, resolution_px=resolution_px)
+    traj_params = camera.TrajectoryParams(type="rotate_forward", num_steps=num_views)
+    max_offset_xyz = camera.compute_max_offset(scene, traj_params, resolution_px, focal_px)
+    arc_radius = float(max(max_offset_xyz[0], 1e-4))
 
     yaw_values = torch.linspace(-max_yaw_deg, max_yaw_deg, num_views, device=device)
     extrinsics = []
-    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
     for yaw_deg in yaw_values:
         yaw = torch.deg2rad(yaw_deg)
-        cos_v = torch.cos(yaw)
-        sin_v = torch.sin(yaw)
-        rot_y = torch.tensor(
+        eye = torch.stack(
             [
-                [cos_v, 0.0, sin_v],
-                [0.0, 1.0, 0.0],
-                [-sin_v, 0.0, cos_v],
-            ],
-            device=device,
-            dtype=torch.float32,
+                arc_radius * torch.sin(yaw),
+                torch.tensor(0.0, dtype=torch.float32, device=device),
+                arc_radius * (1.0 - torch.cos(yaw)),
+            ]
         )
-        eye = center + rot_y @ rel
-        extrinsics.append(
-            create_camera_matrix(
-                position=eye,
-                look_at_position=center,
-                world_up=world_up,
-                inverse=True,
-            )
-        )
+        extrinsics.append(camera_model.compute(eye).extrinsics.to(device))
     return torch.stack(extrinsics, dim=0)
 
 
