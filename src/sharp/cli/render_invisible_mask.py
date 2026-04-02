@@ -6,7 +6,6 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 from pathlib import Path
 
@@ -190,48 +189,7 @@ def build_intrinsics_from_image(f_px: float, width: int, height: int, device: to
     )
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """Use OpenCV if available; otherwise fallback to scipy morphology."""
-    if importlib.util.find_spec("cv2") is not None:
-        return apply_morphology_opencv(mask, radius)
-    return apply_morphology_scipy(mask, radius)
-
-
-def apply_morphology_opencv(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """OpenCV pipeline: blur+threshold + open/close + small-component filtering."""
-    if radius <= 0:
-        return (mask > 0.5).float()
-    import cv2
-
-    mask_np = (mask.detach().cpu().numpy() > 0.5).astype(np.uint8)
-    processed = np.zeros_like(mask_np, dtype=np.float32)
-    blur_size = int(max(3, min(2 * radius + 1, 15)))
-    if blur_size % 2 == 0:
-        blur_size += 1
-    kernel_size = int(max(3, min(2 * radius + 1, 11)))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    min_component_area = max(4, radius * radius)
-
-    for batch_index in range(mask_np.shape[0]):
-        for channel_index in range(mask_np.shape[1]):
-            binary = (mask_np[batch_index, channel_index] * 255).astype(np.uint8)
-            blurred = cv2.GaussianBlur(binary, (blur_size, blur_size), 0)
-            _, binary = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-            filtered = np.zeros_like(binary)
-            for label in range(1, num_labels):
-                area = stats[label, cv2.CC_STAT_AREA]
-                if area >= min_component_area:
-                    filtered[labels == label] = 255
-            processed[batch_index, channel_index] = (filtered > 0).astype(np.float32)
-
-    return torch.from_numpy(processed).to(mask.device)
-
-
-def apply_morphology_scipy(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """Scipy fallback: conservative morphology to smooth boundaries without collapsing mask."""
+    """Use conservative scipy morphology to smooth boundaries without collapsing mask."""
     if radius <= 0:
         return (mask > 0.5).float()
     mask_np = (mask.detach().cpu().numpy() > 0.5)
