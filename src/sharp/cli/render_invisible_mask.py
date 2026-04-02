@@ -12,8 +12,8 @@ from pathlib import Path
 import click
 import imageio.v2 as iio
 import numpy as np
+import scipy.ndimage as ndi
 import torch
-import torch.nn.functional as F
 
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
@@ -189,23 +189,40 @@ def build_intrinsics_from_image(f_px: float, width: int, height: int, device: to
     )
 
 def apply_morphology(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    """Remove isolated black holes and smooth black/white boundaries."""
+    """Use mature image morphology to smooth boundaries and remove outlier speckles."""
     if radius <= 0:
         return (mask > 0.5).float()
-    binary = (mask > 0.5).float()
-    # 1) Remove isolated black points/holes inside white regions.
-    black = 1.0 - binary
-    black_support = F.avg_pool2d(black, kernel_size=3, stride=1, padding=1) * 9.0
-    black = black * (black_support >= 4.0).float()
-    filled = 1.0 - black
+    mask_np = (mask.detach().cpu().numpy() > 0.5)
+    structure = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
+    min_component_area = max(8, radius * radius * 2)
+    processed = np.zeros_like(mask_np, dtype=np.float32)
 
-    # 2) Smooth boundary with local voting.
-    smoothed = (F.avg_pool2d(filled, kernel_size=5, stride=1, padding=2) > 0.5).float()
+    for batch_index in range(mask_np.shape[0]):
+        for channel_index in range(mask_np.shape[1]):
+            binary = mask_np[batch_index, channel_index]
+            # Smooth and regularize contour.
+            binary = ndi.binary_opening(binary, structure=structure)
+            binary = ndi.binary_closing(binary, structure=structure)
 
-    # 3) One close/open round to regularize contour.
-    kernel = 2 * radius + 1
-    dilated = F.max_pool2d(smoothed, kernel_size=kernel, stride=1, padding=radius)
-    closed = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=kernel, stride=1, padding=radius)
-    eroded = 1.0 - F.max_pool2d(1.0 - closed, kernel_size=kernel, stride=1, padding=radius)
-    opened = F.max_pool2d(eroded, kernel_size=kernel, stride=1, padding=radius)
-    return (opened > 0.5).float()
+            # Remove small white speckles/islands.
+            labels, num_labels = ndi.label(binary)
+            if num_labels > 0:
+                counts = np.bincount(labels.ravel())
+                keep = counts >= min_component_area
+                keep[0] = False
+                binary = keep[labels]
+
+            # Fill tiny black holes (isolated black dots).
+            inv_labels, inv_num_labels = ndi.label(~binary)
+            if inv_num_labels > 0:
+                inv_counts = np.bincount(inv_labels.ravel())
+                hole_keep = inv_counts >= min_component_area
+                hole_keep[0] = True
+                binary = ~(hole_keep[inv_labels])
+
+            # Final edge smoothing with Gaussian + threshold.
+            smoothed = ndi.gaussian_filter(binary.astype(np.float32), sigma=max(0.8, radius * 0.5))
+            binary = smoothed > 0.5
+            processed[batch_index, channel_index] = binary.astype(np.float32)
+
+    return torch.from_numpy(processed).to(mask.device)
