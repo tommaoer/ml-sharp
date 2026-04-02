@@ -21,6 +21,7 @@ from sharp.utils import logging as logging_utils
 from sharp.utils import camera
 from sharp.utils.gsplat import GSplatRenderer
 
+from .finetune import compute_target_invisible_mask
 from .predict import DEFAULT_MODEL_URL, predict_image
 
 LOGGER = logging.getLogger(__name__)
@@ -46,7 +47,6 @@ LOGGER = logging.getLogger(__name__)
     help="Path to SHARP checkpoint. Defaults to released checkpoint.",
 )
 @click.option("--fps", type=float, default=30.0, show_default=True)
-@click.option("--alpha-threshold", type=float, default=0.01, show_default=True)
 @click.option("--morph-radius", type=int, default=2, show_default=True)
 @click.option("--num-views", type=int, default=81, show_default=True)
 @click.option("--save-video/--no-save-video", default=True, show_default=True)
@@ -57,7 +57,6 @@ def render_invisible_mask_cli(
     output_dir: Path,
     checkpoint_path: Path | None,
     fps: float,
-    alpha_threshold: float,
     morph_radius: int,
     num_views: int,
     save_video: bool,
@@ -107,19 +106,37 @@ def render_invisible_mask_cli(
         video_writer = iio.get_writer(output_dir / "invisible_mask.mp4", fps=fps)
 
     gaussians = gaussians.to(device_t)
+    source_intrinsics = build_intrinsics_from_image(f_px, image_w, image_h, device_t)[None]
+    source_extrinsics = torch.eye(4, dtype=torch.float32, device=device_t)[None]
+    source_render = renderer(
+        gaussians=gaussians,
+        extrinsics=source_extrinsics,
+        intrinsics=source_intrinsics,
+        image_width=image_w,
+        image_height=image_h,
+    )
+    source_depth = source_render.depth[:, 0:1]
+
     rendered_dir = output_dir / "rendered_color"
     rendered_dir.mkdir(parents=True, exist_ok=True)
     for frame_index, eye_position in enumerate(trajectory):
         camera_info = camera_model.compute(eye_position)
+        target_extrinsics = camera_info.extrinsics[None].to(device_t)
+        target_intrinsics = camera_info.intrinsics[None].to(device_t)
         render_out = renderer(
             gaussians=gaussians,
-            extrinsics=camera_info.extrinsics[None].to(device_t),
-            intrinsics=camera_info.intrinsics[None].to(device_t),
+            extrinsics=target_extrinsics,
+            intrinsics=target_intrinsics,
             image_width=camera_info.width,
             image_height=camera_info.height,
         )
-        visible = render_out.alpha[0:1, 0:1]
-        invisible_mask = (visible <= alpha_threshold).float()
+        invisible_mask = compute_target_invisible_mask(
+            source_depth=source_depth,
+            source_intrinsics=source_intrinsics,
+            source_extrinsics=source_extrinsics,
+            target_intrinsics=target_intrinsics,
+            target_extrinsics=target_extrinsics,
+        )
         invisible_mask = apply_morphology(invisible_mask, morph_radius)
 
         mask_np = (invisible_mask[0, 0] * 255.0).to(dtype=torch.uint8).detach().cpu().numpy()
