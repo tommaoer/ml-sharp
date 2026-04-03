@@ -149,7 +149,7 @@ def decompose_covariance_matrices(
     dtype = covariance_matrices.dtype
 
     # We convert to fp64 to avoid numerical errors.
-    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
+    covariance_matrices = covariance_matrices.detach().to(torch.float64)
     rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
 
     # NOTE: in SVD, it is possible that U and VT are both reflections.
