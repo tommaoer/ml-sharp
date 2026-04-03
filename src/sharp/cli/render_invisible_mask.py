@@ -49,6 +49,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--fps", type=float, default=30.0, show_default=True)
 @click.option("--morph-radius", type=int, default=2, show_default=True)
 @click.option("--num-views", type=int, default=81, show_default=True)
+@click.option("--trajectory-scale", type=float, default=1.4, show_default=True)
 @click.option("--save-video/--no-save-video", default=True, show_default=True)
 @click.option("--device", type=str, default="default", help="cuda / cpu / mps / default")
 @click.option("-v", "--verbose", is_flag=True)
@@ -59,6 +60,7 @@ def render_invisible_mask_cli(
     fps: float,
     morph_radius: int,
     num_views: int,
+    trajectory_scale: float,
     save_video: bool,
     device: str,
     verbose: bool,
@@ -99,6 +101,8 @@ def render_invisible_mask_cli(
         resolution_px=(image_w, image_h),
         f_px=float(f_px),
     )
+    trajectory_scale = max(float(trajectory_scale), 0.1)
+    trajectory = [eye_position * trajectory_scale for eye_position in trajectory]
 
     renderer = GSplatRenderer(color_space="linearRGB", background_color="black").to(device_t)
     video_writer = None
