@@ -15,6 +15,7 @@ import click
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torch.utils.data import DataLoader
 
 from sharp.cli.predict import DEFAULT_MODEL_URL
@@ -92,6 +93,9 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--keep-weight", type=float, default=0.0, show_default=True)
 @click.option("--target-global-weight", type=float, default=0.1, show_default=True)
 @click.option("--gaussian-mask-dilation-px", type=int, default=8, show_default=True)
+@click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
+@click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
+@click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.15, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
@@ -129,6 +133,9 @@ def finetune_cli(
     keep_weight: float,
     target_global_weight: float,
     gaussian_mask_dilation_px: int,
+    delta_hidden_dim: int,
+    delta_geometry_scale: float,
+    delta_texture_scale: float,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
     verbose: bool,
@@ -150,7 +157,12 @@ def finetune_cli(
         )
     LOGGER.info("Using device %s", device_t)
 
-    predictor = build_finetune_predictor(checkpoint_path).to(device_t)
+    predictor = build_finetune_predictor(
+        checkpoint_path,
+        delta_hidden_dim=delta_hidden_dim,
+        delta_geometry_scale=delta_geometry_scale,
+        delta_texture_scale=delta_texture_scale,
+    ).to(device_t)
     internal_resolution = (1536, 1536)
     if data_root is not None:
         dataset = MultiScenePosedVideoDataset(
@@ -205,7 +217,7 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names = ["feature_model"]
+    trainable_module_names = ["delta_decoder"]
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
     ]
@@ -248,6 +260,9 @@ def finetune_cli(
             "keep_weight": keep_weight,
             "target_global_weight": target_global_weight,
             "gaussian_mask_dilation_px": gaussian_mask_dilation_px,
+            "delta_hidden_dim": delta_hidden_dim,
+            "delta_geometry_scale": delta_geometry_scale,
+            "delta_texture_scale": delta_texture_scale,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
             "trainable_parameter_names": trainable_parameter_names,
@@ -342,13 +357,62 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def build_finetune_predictor(checkpoint_path: Path | None):
-    """Create SHARP predictor and train only gaussian decoder feature model."""
+class LightweightDeltaDecoder(nn.Module):
+    """Lightweight residual decoder that predicts additive gaussian deltas."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        num_layers: int,
+        hidden_dim: int = 64,
+        geometry_scale: float = 0.05,
+        texture_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        in_channels = feature_dim * 2
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, 14 * num_layers, kernel_size=1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        channel_scale = torch.full((14,), float(texture_scale), dtype=torch.float32)
+        channel_scale[0:3] = float(geometry_scale)
+        self.register_buffer("channel_scale", channel_scale.view(1, 14, 1, 1, 1))
+        self.num_layers = num_layers
+
+    def forward(self, image_features) -> torch.Tensor:
+        features = torch.cat(
+            [image_features.geometry_features, image_features.texture_features], dim=1
+        )
+        delta = self.net(features).unflatten(1, (14, self.num_layers))
+        return delta * self.channel_scale
+
+
+def build_finetune_predictor(
+    checkpoint_path: Path | None,
+    delta_hidden_dim: int,
+    delta_geometry_scale: float,
+    delta_texture_scale: float,
+):
+    """Create SHARP predictor and train a lightweight additive delta decoder."""
     params = PredictorParams()
     predictor = create_predictor(params)
     predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
     predictor.requires_grad_(False)
-    predictor.feature_model.requires_grad_(True)
+    feature_dim = predictor.prediction_head.geometry_prediction_head.in_channels
+    num_layers = predictor.prediction_head.num_layers
+    predictor.delta_decoder = LightweightDeltaDecoder(
+        feature_dim=feature_dim,
+        num_layers=num_layers,
+        hidden_dim=delta_hidden_dim,
+        geometry_scale=delta_geometry_scale,
+        texture_scale=delta_texture_scale,
+    )
+    predictor.delta_decoder.requires_grad_(True)
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
@@ -433,6 +497,7 @@ def forward_training_pass(
         encodings=monodepth_output.output_features,
     )
     delta_values = predictor.prediction_head(image_features)
+    delta_values = delta_values + predictor.delta_decoder(image_features)
     gaussians_ndc = predictor.gaussian_composer(
         delta=delta_values,
         base_values=init_output.gaussian_base_values,
