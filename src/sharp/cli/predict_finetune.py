@@ -133,7 +133,34 @@ def load_predictor_state_dict(checkpoint_path: Path | None) -> dict[str, Any]:
     LOGGER.info("Loading checkpoint from %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(checkpoint, dict) and "predictor" in checkpoint:
-        return checkpoint["predictor"]
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        return checkpoint["model"]
-    return checkpoint
+        state_dict = checkpoint["predictor"]
+    elif isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unsupported checkpoint payload type: {type(state_dict)!r}")
+
+    cleaned_state_dict = strip_uninferenceable_keys(state_dict)
+    return cleaned_state_dict
+
+
+def strip_uninferenceable_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Drop training-only keys that are not part of base RGBGaussianPredictor inference."""
+    cleaned: dict[str, Any] = {}
+    dropped_keys: list[str] = []
+    for key, value in state_dict.items():
+        normalized_key = key[7:] if key.startswith("module.") else key
+        if normalized_key.startswith("delta_decoder."):
+            dropped_keys.append(key)
+            continue
+        cleaned[normalized_key] = value
+
+    if dropped_keys:
+        LOGGER.info(
+            "Ignoring %d training-only keys (e.g. %s) before loading predictor weights.",
+            len(dropped_keys),
+            dropped_keys[0],
+        )
+    return cleaned

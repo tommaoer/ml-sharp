@@ -60,6 +60,9 @@ while tolerating architecture/key differences, use:
 sharp predict-finetune -i /path/to/input/images -o /path/to/output/gaussians -c /path/to/finetune_checkpoint.pt
 ```
 
+`predict-finetune` ignores training-only `delta_decoder.*` keys so you can still use `--strict`
+to validate base predictor weights.
+
 The results will be 3D gaussian splats (3DGS) in the output folder. The 3DGS `.ply` files are compatible to various public 3DGS renderers. We follow the OpenCV coordinate convention (x right, y down, z forward). The 3DGS scene center is roughly at (0, 0, +z). When dealing with 3rdparty renderers, please scale and rotate to re-center the scene accordingly.
 
 ### Rendering trajectories (CUDA GPU only)
