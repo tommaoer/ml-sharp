@@ -74,6 +74,9 @@ sharp predict -i /path/to/input/images -o /path/to/output/gaussians --render
 
 # Or from the intermediate gaussians:
 sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
+
+# Increase/decrease camera motion range:
+sharp render -i /path/to/output/gaussians -o /path/to/output/renderings --trajectory-scale 1.4
 ```
 
 
