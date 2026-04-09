@@ -62,6 +62,8 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--alpha-weight", type=float, default=0.05, show_default=True)
 @click.option("--perceptual-weight", type=float, default=0.1, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.15, show_default=True)
+@click.option("--invisible-mask-dilation-px", type=int, default=6, show_default=True)
+@click.option("--invisible-loss-boost", type=float, default=1.5, show_default=True)
 @click.option("--gaussian-mask-dilation-px", type=int, default=8, show_default=True)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
@@ -91,6 +93,8 @@ def finetune_ddp_cli(
     alpha_weight: float,
     perceptual_weight: float,
     loss_border_ratio: float,
+    invisible_mask_dilation_px: int,
+    invisible_loss_boost: float,
     gaussian_mask_dilation_px: int,
     delta_hidden_dim: int,
     delta_geometry_scale: float,
@@ -171,9 +175,9 @@ def finetune_ddp_cli(
     renderer = GSplatRenderer(color_space="linearRGB", background_color="black").to(device_t)
     loss_module = FineTuneLoss(
         weights=FineTuneLossWeights(
-            color=color_weight,
-            alpha=alpha_weight,
-            perceptual=perceptual_weight,
+            color=color_weight * max(float(invisible_loss_boost), 0.0),
+            alpha=alpha_weight * max(float(invisible_loss_boost), 0.0),
+            perceptual=perceptual_weight * max(float(invisible_loss_boost), 0.0),
         ),
         use_perceptual=perceptual,
     ).to(device_t)
@@ -195,6 +199,8 @@ def finetune_ddp_cli(
                 "lr": lr,
                 "weight_decay": weight_decay,
                 "samples_per_epoch": samples_per_epoch,
+                "invisible_mask_dilation_px": invisible_mask_dilation_px,
+                "invisible_loss_boost": invisible_loss_boost,
                 "gaussian_mask_dilation_px": gaussian_mask_dilation_px,
                 "delta_hidden_dim": delta_hidden_dim,
                 "delta_geometry_scale": delta_geometry_scale,
@@ -213,6 +219,7 @@ def finetune_ddp_cli(
                 renderer,
                 batch,
                 loss_border_ratio=loss_border_ratio,
+                invisible_mask_dilation_px=invisible_mask_dilation_px,
                 gaussian_mask_dilation_px=gaussian_mask_dilation_px,
             )
             losses = loss_module(
@@ -276,4 +283,3 @@ def save_ddp_checkpoint(
 
 def write_ddp_config(path: Path, config: dict[str, Any]) -> None:
     path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-

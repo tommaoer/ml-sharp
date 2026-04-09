@@ -92,6 +92,8 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--scale-tv-weight", type=float, default=0.0, show_default=True)
 @click.option("--keep-weight", type=float, default=0.0, show_default=True)
 @click.option("--target-global-weight", type=float, default=0.1, show_default=True)
+@click.option("--invisible-mask-dilation-px", type=int, default=6, show_default=True)
+@click.option("--invisible-loss-boost", type=float, default=1.5, show_default=True)
 @click.option("--gaussian-mask-dilation-px", type=int, default=8, show_default=True)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
@@ -132,6 +134,8 @@ def finetune_cli(
     scale_tv_weight: float,
     keep_weight: float,
     target_global_weight: float,
+    invisible_mask_dilation_px: int,
+    invisible_loss_boost: float,
     gaussian_mask_dilation_px: int,
     delta_hidden_dim: int,
     delta_geometry_scale: float,
@@ -201,9 +205,9 @@ def finetune_cli(
     ).to(device_t)
     loss_module = FineTuneLoss(
         weights=FineTuneLossWeights(
-            color=color_weight,
-            alpha=alpha_weight,
-            perceptual=perceptual_weight,
+            color=color_weight * max(float(invisible_loss_boost), 0.0),
+            alpha=alpha_weight * max(float(invisible_loss_boost), 0.0),
+            perceptual=perceptual_weight * max(float(invisible_loss_boost), 0.0),
             depth=1.0 if depth_loss else 0.0,
             depth_tv=0.0 if not depth_loss else depth_tv_weight,
             grad=0.0 if not depth_loss else grad_weight,
@@ -259,6 +263,8 @@ def finetune_cli(
             "scale_tv_weight": scale_tv_weight,
             "keep_weight": keep_weight,
             "target_global_weight": target_global_weight,
+            "invisible_mask_dilation_px": invisible_mask_dilation_px,
+            "invisible_loss_boost": invisible_loss_boost,
             "gaussian_mask_dilation_px": gaussian_mask_dilation_px,
             "delta_hidden_dim": delta_hidden_dim,
             "delta_geometry_scale": delta_geometry_scale,
@@ -280,6 +286,7 @@ def finetune_cli(
                 renderer,
                 batch,
                 loss_border_ratio=loss_border_ratio,
+                invisible_mask_dilation_px=invisible_mask_dilation_px,
                 gaussian_mask_dilation_px=gaussian_mask_dilation_px,
             )
             losses = loss_module(
@@ -456,6 +463,7 @@ def forward_training_pass(
     renderer: GSplatRenderer,
     batch: dict[str, torch.Tensor | None],
     loss_border_ratio: float,
+    invisible_mask_dilation_px: int,
     gaussian_mask_dilation_px: int,
 ) -> dict[str, torch.Tensor | RenderingOutputs | Gaussians3D]:
     """Run input-frame -> NDC Gaussians -> world-space -> target rendering."""
@@ -528,6 +536,7 @@ def forward_training_pass(
     # Only optimize target regions that are occluded from the source view and
     # remain inside the user-specified central crop.
     loss_region_mask = loss_region_mask * invisible_mask
+    loss_region_mask = dilate_binary_mask(loss_region_mask, dilation_px=invisible_mask_dilation_px)
     gaussian_gate_mask = dilate_binary_mask(loss_region_mask, dilation_px=gaussian_mask_dilation_px)
     gaussian_update_gate = compute_gaussian_invisible_gate(
         gaussians_world=gaussians_world,
