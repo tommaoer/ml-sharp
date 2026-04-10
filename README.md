@@ -53,6 +53,16 @@ To use a manually downloaded checkpoint, specify it with the `-c` flag:
 sharp predict -i /path/to/input/images -o /path/to/output/gaussians -c sharp_2572gikvuh.pt
 ```
 
+If you want to run inference with fine-tuning checkpoints saved by `sharp finetune` / `sharp finetune-ddp`
+while tolerating architecture/key differences, use:
+
+```
+sharp predict-finetune -i /path/to/input/images -o /path/to/output/gaussians -c /path/to/finetune_checkpoint.pt
+```
+
+`predict-finetune` uses `delta_decoder.*` by default so finetuned deltas participate in inference.
+If you want baseline comparison behavior, pass `--ignore-delta`.
+
 The results will be 3D gaussian splats (3DGS) in the output folder. The 3DGS `.ply` files are compatible to various public 3DGS renderers. We follow the OpenCV coordinate convention (x right, y down, z forward). The 3DGS scene center is roughly at (0, 0, +z). When dealing with 3rdparty renderers, please scale and rotate to re-center the scene accordingly.
 
 ### Rendering trajectories (CUDA GPU only)
@@ -64,7 +74,55 @@ sharp predict -i /path/to/input/images -o /path/to/output/gaussians --render
 
 # Or from the intermediate gaussians:
 sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
+
+# Increase/decrease camera motion range:
+sharp render -i /path/to/output/gaussians -o /path/to/output/renderings --trajectory-scale 1.4
 ```
+
+
+## Fine-tuning on posed videos
+
+This repository now also includes a scene fine-tuning entrypoint for either a **single posed video** or a **directory of many scene folders**. The training loop follows the requested pipeline:
+
+1. Randomly sample an input frame.
+2. Run the pretrained SHARP predictor to obtain Gaussians in NDC space.
+3. Map these Gaussians to world space with the input-frame intrinsics/extrinsics.
+4. Randomly sample a target frame with a configurable frame-distance range.
+5. Render the world-space Gaussians in the target camera and optimize the Gaussian Decoder.
+
+Expected multi-scene input layout:
+
+```
+/path/to/data_root/
+  scene_000/
+    video.mp4
+    camera_params.json
+  scene_001/
+    clip.mp4
+    camera_params_old.json
+    camera_params.json
+```
+
+Each pose JSON file should contain `fl_x`, `fl_y`, `cx`, `cy`, and a `c2ws` array with one 4x4 camera-to-world matrix per video frame. When multiple JSON files exist in one scene folder, the loader prefers `camera_params.json` (and ignores legacy `camera_params_old.json` when possible). A typical multi-scene command is:
+
+```
+sharp finetune \
+  --data-root /path/to/data_root \
+  --output-dir /path/to/output_dir \
+  --checkpoint-path /path/to/sharp_2572gikvuh.pt \
+  --min-frame-distance 4 \
+  --max-frame-distance 48
+```
+
+If you only want to fine-tune on one video, you can still pass `--video-path` and `--pose-path`.
+
+If mask-focused improvement is too weak, increase `--invisible-mask-dilation-px` (expand supervised mask area) and/or `--invisible-loss-boost` (upweight mask-region reconstruction losses).
+The `--loss-border-ratio` controls the center-region crop before intersecting with the invisible-mask region. Set `--loss-border-ratio 0.0` to use the full image ∩ invisible-mask intersection.
+Depth files (`depth_sequence.npy`) are only loaded when `--depth-loss` is enabled.
+When `--depth-loss` is enabled, depth arrays are loaded lazily on demand (not at dataset init), which reduces long startup stalls on very large datasets.
+Video frames are also fetched on demand; enabling `--preload-video` now enables per-frame caching during sampling instead of reading the whole video at startup.
+
+The command keeps the network input at `1536x1536`, but it also preserves each frame's original resolution for debugging renders. Fine-tuning updates the predictor `feature_model` together with a mask-guided Gaussian refiner, while the other predictor modules stay frozen. The target-view supervision now detects regions that are visible in the target view but invisible from the source view, predicts additive Gaussian deltas for those gated Gaussians, and re-renders the refined target view. Each visualization step saves 10 images: source/target frames at training and original resolution, the target-invisible mask, the masked target-region render, source-view Gaussian renders at training and original resolution, and target-view Gaussian renders at training and original resolution. A `step_000000.*` visualization is still saved at `epoch=0, step=0` before that iteration's optimizer update. By default, fine-tuning uses `--low-pass-filter-eps 0.0` so the debug renders match the standard SHARP render path instead of adding extra smoothing. Fine-tuning currently requires CUDA because the training loop uses differentiable `gsplat` rendering.
 
 ## Evaluation
 
