@@ -83,7 +83,9 @@ class PosedVideoScene:
         if not depth_path.exists():
             return None
 
-        depth_np = np.load(depth_path, mmap_mode="r")
+        # Use eager loading instead of memmap to avoid keeping one file descriptor
+        # open per scene (can hit "Too many open files" on large multi-scene runs).
+        depth_np = np.load(depth_path)
         if depth_np.ndim == 3:
             depth_np = depth_np[:, None, :, :]
         elif depth_np.ndim == 4 and depth_np.shape[-1] == 1:
