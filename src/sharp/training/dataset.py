@@ -64,6 +64,7 @@ class PosedVideoScene:
         self.refiner_resolution = refiner_resolution or internal_resolution
         self.preload = preload
         self.load_depth = load_depth
+        self.depth_path = self.video_path.parent / "depth_sequence.npy"
 
         with self.pose_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
@@ -78,16 +79,16 @@ class PosedVideoScene:
 
         self.intrinsics = self._create_intrinsics(metadata)
         self.frames = self._load_video_frames() if preload else None
-        self.depth_sequence = self._load_depth_sequence() if self.load_depth else None
+        # Depth loading is lazy to avoid long startup on very large multi-scene datasets.
+        self.depth_sequence = None
 
     def _load_depth_sequence(self) -> np.ndarray | None:
-        depth_path = self.video_path.parent / "depth_sequence.npy"
-        if not depth_path.exists():
+        if not self.depth_path.exists():
             return None
 
         # Use eager loading instead of memmap to avoid keeping one file descriptor
         # open per scene (can hit "Too many open files" on large multi-scene runs).
-        depth_np = np.load(depth_path)
+        depth_np = np.load(self.depth_path)
         if depth_np.ndim == 3:
             depth_np = depth_np[:, None, :, :]
         elif depth_np.ndim == 4 and depth_np.shape[-1] == 1:
@@ -96,11 +97,11 @@ class PosedVideoScene:
             raise ValueError(
                 f"Expected depth_sequence.npy to have shape [T, H, W], [T, 1, H, W], or "
                 f"[T, H, W, 1], got "
-                f"{tuple(depth_np.shape)} in {depth_path}."
+                f"{tuple(depth_np.shape)} in {self.depth_path}."
             )
         if depth_np.shape[0] < self.num_frames:
             raise ValueError(
-                f"Depth sequence {depth_path} has {depth_np.shape[0]} frames but pose json "
+                f"Depth sequence {self.depth_path} has {depth_np.shape[0]} frames but pose json "
                 f"expects {self.num_frames}."
             )
         return depth_np[: self.num_frames]
@@ -115,13 +116,18 @@ class PosedVideoScene:
         return intrinsics
 
     def _load_video_frames(self) -> list[torch.Tensor]:
-        frames = list(iio.imiter(self.video_path))
-        if len(frames) < self.num_frames:
+        reader = iio.get_reader(self.video_path)
+        frames: list[torch.Tensor] = []
+        try:
+            for frame_index in range(self.num_frames):
+                frames.append(self._frame_to_tensor(reader.get_data(frame_index)))
+        except IndexError as exc:
             raise ValueError(
-                f"Video {self.video_path} has {len(frames)} frames but json expects "
-                f"{self.num_frames}."
-            )
-        return [self._frame_to_tensor(frame) for frame in frames[: self.num_frames]]
+                f"Video {self.video_path} has fewer than {self.num_frames} frames required by pose json."
+            ) from exc
+        finally:
+            reader.close()
+        return frames
 
     @staticmethod
     def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
@@ -186,6 +192,9 @@ class PosedVideoScene:
             refiner_height,
         )
         depth = None
+        if self.load_depth:
+            if self.depth_sequence is None:
+                self.depth_sequence = self._load_depth_sequence()
         if self.depth_sequence is not None:
             depth_frame = torch.from_numpy(
                 np.array(self.depth_sequence[frame_index], copy=True)
