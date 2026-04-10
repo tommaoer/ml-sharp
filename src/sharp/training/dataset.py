@@ -65,6 +65,7 @@ class PosedVideoScene:
         self.preload = preload
         self.load_depth = load_depth
         self.depth_path = self.video_path.parent / "depth_sequence.npy"
+        self.frame_cache: dict[int, torch.Tensor] | None = {} if self.preload else None
 
         with self.pose_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
@@ -78,7 +79,6 @@ class PosedVideoScene:
             raise ValueError(f"Scene {self.scene_name} must contain at least two frames.")
 
         self.intrinsics = self._create_intrinsics(metadata)
-        self.frames = self._load_video_frames() if preload else None
         # Depth loading is lazy to avoid long startup on very large multi-scene datasets.
         self.depth_sequence = None
 
@@ -115,20 +115,6 @@ class PosedVideoScene:
         intrinsics[1, 2] = float(metadata["cy"])
         return intrinsics
 
-    def _load_video_frames(self) -> list[torch.Tensor]:
-        reader = iio.get_reader(self.video_path)
-        frames: list[torch.Tensor] = []
-        try:
-            for frame_index in range(self.num_frames):
-                frames.append(self._frame_to_tensor(reader.get_data(frame_index)))
-        except IndexError as exc:
-            raise ValueError(
-                f"Video {self.video_path} has fewer than {self.num_frames} frames required by pose json."
-            ) from exc
-        finally:
-            reader.close()
-        return frames
-
     @staticmethod
     def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
         if frame.ndim == 2:
@@ -137,14 +123,17 @@ class PosedVideoScene:
 
     def load_frame(self, frame_index: int) -> torch.Tensor:
         """Load one RGB frame from the scene video."""
-        if self.frames is not None:
-            return self.frames[frame_index].clone()
+        if self.frame_cache is not None and frame_index in self.frame_cache:
+            return self.frame_cache[frame_index].clone()
         reader = iio.get_reader(self.video_path)
         try:
             frame = reader.get_data(frame_index)
         finally:
             reader.close()
-        return self._frame_to_tensor(frame)
+        frame_tensor = self._frame_to_tensor(frame)
+        if self.frame_cache is not None:
+            self.frame_cache[frame_index] = frame_tensor
+        return frame_tensor
 
     @staticmethod
     def _scale_intrinsics(
