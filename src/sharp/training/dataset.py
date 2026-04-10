@@ -66,6 +66,7 @@ class PosedVideoScene:
         self.load_depth = load_depth
         self.depth_path = self.video_path.parent / "depth_sequence.npy"
         self.frame_cache: dict[int, torch.Tensor] | None = {} if self.preload else None
+        self._video_reader = None
 
         with self.pose_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
@@ -125,15 +126,31 @@ class PosedVideoScene:
         """Load one RGB frame from the scene video."""
         if self.frame_cache is not None and frame_index in self.frame_cache:
             return self.frame_cache[frame_index].clone()
-        reader = iio.get_reader(self.video_path)
+        reader = self._get_video_reader()
         try:
             frame = reader.get_data(frame_index)
-        finally:
-            reader.close()
+        except Exception:
+            # Re-open reader once in case ffmpeg backend got into a bad state.
+            self.close_video_reader()
+            reader = self._get_video_reader()
+            frame = reader.get_data(frame_index)
         frame_tensor = self._frame_to_tensor(frame)
         if self.frame_cache is not None:
             self.frame_cache[frame_index] = frame_tensor
         return frame_tensor
+
+    def _get_video_reader(self):
+        if self._video_reader is None:
+            self._video_reader = iio.get_reader(self.video_path)
+        return self._video_reader
+
+    def close_video_reader(self) -> None:
+        if self._video_reader is not None:
+            self._video_reader.close()
+            self._video_reader = None
+
+    def __del__(self) -> None:
+        self.close_video_reader()
 
     @staticmethod
     def _scale_intrinsics(
