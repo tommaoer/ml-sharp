@@ -300,19 +300,45 @@ class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
                 for path in sorted(scene_dir.iterdir())
                 if path.is_file() and path.suffix == ".json"
             ]
-            if len(video_candidates) != 1 or len(json_candidates) != 1:
+            pose_json = self._select_pose_json(scene_dir, json_candidates)
+            if len(video_candidates) != 1 or pose_json is None:
                 raise ValueError(
-                    f"Each scene folder must contain exactly one video and one json: {scene_dir}."
+                    f"Each scene folder must contain exactly one video and at least one valid pose json: "
+                    f"{scene_dir}."
                 )
             self.scenes.append(
                 PosedVideoScene(
                     video_candidates[0],
-                    json_candidates[0],
+                    pose_json,
                     internal_resolution=internal_resolution,
                     refiner_resolution=refiner_resolution,
                     preload=preload,
                 )
             )
+
+    @staticmethod
+    def _select_pose_json(scene_dir: Path, json_candidates: list[Path]) -> Path | None:
+        """Select preferred pose json from a scene directory.
+
+        Preference order:
+          1) camera_params.json
+          2) poses.json
+          3) cameras.json
+          4) any other json that is not a known legacy/backup file.
+        """
+        if not json_candidates:
+            return None
+
+        preferred_names = ("camera_params.json", "poses.json", "cameras.json")
+        for name in preferred_names:
+            for path in json_candidates:
+                if path.name == name:
+                    return path
+
+        filtered = [
+            path for path in json_candidates if path.stem not in {"camera_params_old", "poses_old"}
+        ]
+        return filtered[0] if filtered else json_candidates[0]
 
     def _sample_target_index(self, scene: PosedVideoScene, source_index: int) -> int:
         candidates = [
