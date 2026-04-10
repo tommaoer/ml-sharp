@@ -35,8 +35,15 @@ LOGGER = logging.getLogger(__name__)
     help="Path to save the rendered videos.",
     required=True,
 )
+@click.option(
+    "--trajectory-scale",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Scale factor applied to the generated eye trajectory positions.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
-def render_cli(input_path: Path, output_path: Path, verbose: bool):
+def render_cli(input_path: Path, output_path: Path, trajectory_scale: float, verbose: bool):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
@@ -63,6 +70,7 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
             gaussians=gaussians,
             metadata=metadata,
             params=params,
+            trajectory_scale=trajectory_scale,
             output_path=(output_path / scene_path.stem).with_suffix(".mp4"),
         )
 
@@ -72,6 +80,7 @@ def render_gaussians(
     metadata: SceneMetaData,
     output_path: Path,
     params: camera.TrajectoryParams | None = None,
+    trajectory_scale: float = 1.0,
 ) -> None:
     """Render a single gaussian checkpoint file."""
     (width, height) = metadata.resolution_px
@@ -102,6 +111,8 @@ def render_gaussians(
     trajectory = camera.create_eye_trajectory(
         gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
+    safe_trajectory_scale = max(float(trajectory_scale), 0.1)
+    trajectory = [eye_position * safe_trajectory_scale for eye_position in trajectory]
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
     video_writer = io.VideoWriter(output_path)
 

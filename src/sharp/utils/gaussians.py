@@ -18,6 +18,7 @@ from sharp.utils import color_space as cs_utils
 from sharp.utils import linalg
 
 LOGGER = logging.getLogger(__name__)
+_HAS_LOGGED_SVD_REFLECTION_WARNING = False
 
 
 BackgroundColor = Literal["black", "white", "random_color", "random_pixel"]
@@ -149,20 +150,29 @@ def decompose_covariance_matrices(
     dtype = covariance_matrices.dtype
 
     # We convert to fp64 to avoid numerical errors.
-    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
+    covariance_matrices = covariance_matrices.detach().to(torch.float64)
     rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
 
     # NOTE: in SVD, it is possible that U and VT are both reflections.
     # We need to correct them.
-    batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
-    num_reflections = len(gaussian_idx)
+    reflection_mask = torch.linalg.det(rotations) < 0
+    num_reflections = int(reflection_mask.sum().item())
     if num_reflections > 0:
-        LOGGER.warning(
-            "Received %d reflection matrices from SVD. Flipping them to rotations.",
-            num_reflections,
-        )
+        global _HAS_LOGGED_SVD_REFLECTION_WARNING
+        if not _HAS_LOGGED_SVD_REFLECTION_WARNING:
+            LOGGER.warning(
+                "Received %d reflection matrices from SVD. Flipping them to rotations. "
+                "Subsequent reflection counts will be logged at DEBUG level.",
+                num_reflections,
+            )
+            _HAS_LOGGED_SVD_REFLECTION_WARNING = True
+        else:
+            LOGGER.debug(
+                "Received %d reflection matrices from SVD. Flipping them to rotations.",
+                num_reflections,
+            )
         # Flip the last column of reflection and make it a rotation.
-        rotations[batch_idx, gaussian_idx, :, -1] *= -1
+        rotations[reflection_mask, :, -1] *= -1
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
