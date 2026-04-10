@@ -148,6 +148,7 @@ def finetune_ddp_cli(
             max_frame_distance=max_frame_distance,
             samples_per_scene=samples_per_epoch,
             preload=preload_video,
+            load_depth=False,
         )
     else:
         assert video_path is not None and pose_path is not None
@@ -159,6 +160,7 @@ def finetune_ddp_cli(
             max_frame_distance=max_frame_distance,
             samples_per_epoch=samples_per_epoch,
             preload=preload_video,
+            load_depth=False,
         )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)

@@ -54,6 +54,7 @@ class PosedVideoScene:
         internal_resolution: tuple[int, int] = (1536, 1536),
         refiner_resolution: tuple[int, int] | None = None,
         preload: bool = False,
+        load_depth: bool = True,
     ) -> None:
         """Initialize one posed-video scene."""
         self.video_path = Path(video_path)
@@ -62,6 +63,7 @@ class PosedVideoScene:
         self.internal_resolution = internal_resolution
         self.refiner_resolution = refiner_resolution or internal_resolution
         self.preload = preload
+        self.load_depth = load_depth
 
         with self.pose_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
@@ -76,7 +78,7 @@ class PosedVideoScene:
 
         self.intrinsics = self._create_intrinsics(metadata)
         self.frames = self._load_video_frames() if preload else None
-        self.depth_sequence = self._load_depth_sequence()
+        self.depth_sequence = self._load_depth_sequence() if self.load_depth else None
 
     def _load_depth_sequence(self) -> np.ndarray | None:
         depth_path = self.video_path.parent / "depth_sequence.npy"
@@ -220,6 +222,7 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
         max_frame_distance: int = 48,
         samples_per_epoch: int | None = None,
         preload: bool = False,
+        load_depth: bool = True,
     ) -> None:
         """Initialize the dataset."""
         self.scene = PosedVideoScene(
@@ -228,6 +231,7 @@ class PosedVideoDataset(Dataset[ViewPairSample]):
             internal_resolution=internal_resolution,
             refiner_resolution=refiner_resolution,
             preload=preload,
+            load_depth=load_depth,
         )
         self.min_frame_distance = min_frame_distance
         self.max_frame_distance = max_frame_distance
@@ -278,6 +282,7 @@ class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
         max_frame_distance: int = 48,
         samples_per_scene: int = 32,
         preload: bool = False,
+        load_depth: bool = True,
         video_extensions: tuple[str, ...] = (".mp4", ".MP4"),
     ) -> None:
         """Initialize the multi-scene dataset."""
@@ -285,6 +290,7 @@ class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
         self.min_frame_distance = min_frame_distance
         self.max_frame_distance = max_frame_distance
         self.samples_per_scene = samples_per_scene
+        self.load_depth = load_depth
 
         scene_dirs = sorted(path for path in self.data_root.iterdir() if path.is_dir())
         if not scene_dirs:
@@ -315,6 +321,7 @@ class MultiScenePosedVideoDataset(Dataset[ViewPairSample]):
                     internal_resolution=internal_resolution,
                     refiner_resolution=refiner_resolution,
                     preload=preload,
+                    load_depth=self.load_depth,
                 )
             )
 

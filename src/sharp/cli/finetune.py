@@ -176,6 +176,7 @@ def finetune_cli(
             max_frame_distance=max_frame_distance,
             samples_per_scene=samples_per_epoch,
             preload=preload_video,
+            load_depth=depth_loss,
         )
     else:
         assert video_path is not None and pose_path is not None
@@ -187,6 +188,7 @@ def finetune_cli(
             max_frame_distance=max_frame_distance,
             samples_per_epoch=samples_per_epoch,
             preload=preload_video,
+            load_depth=depth_loss,
         )
     loader = DataLoader(
         dataset,
@@ -254,6 +256,7 @@ def finetune_cli(
             "max_frame_distance": max_frame_distance,
             "visualize_every": visualize_every,
             "low_pass_filter_eps": low_pass_filter_eps,
+            "depth_loss_enabled": depth_loss,
             "internal_resolution": list(internal_resolution),
             "loss_border_ratio": loss_border_ratio,
             "grad_weight": grad_weight,
