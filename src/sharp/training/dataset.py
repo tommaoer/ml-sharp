@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,9 @@ class ViewPairSample:
 
 class PosedVideoScene:
     """Represents one video sequence with per-frame camera intrinsics/extrinsics."""
+
+    _MAX_OPEN_VIDEO_READERS = 8
+    _OPEN_VIDEO_SCENES: "OrderedDict[int, PosedVideoScene]" = OrderedDict()
 
     def __init__(
         self,
@@ -141,13 +145,31 @@ class PosedVideoScene:
 
     def _get_video_reader(self):
         if self._video_reader is None:
+            self._evict_video_readers_if_needed(exclude_id=id(self))
             self._video_reader = iio.get_reader(self.video_path)
+        self._touch_open_reader()
         return self._video_reader
+
+    def _touch_open_reader(self) -> None:
+        scene_id = id(self)
+        if scene_id in self._OPEN_VIDEO_SCENES:
+            self._OPEN_VIDEO_SCENES.move_to_end(scene_id)
+        self._OPEN_VIDEO_SCENES[scene_id] = self
+
+    @classmethod
+    def _evict_video_readers_if_needed(cls, exclude_id: int) -> None:
+        while len(cls._OPEN_VIDEO_SCENES) >= cls._MAX_OPEN_VIDEO_READERS:
+            oldest_scene_id, oldest_scene = cls._OPEN_VIDEO_SCENES.popitem(last=False)
+            if oldest_scene_id == exclude_id:
+                cls._OPEN_VIDEO_SCENES[oldest_scene_id] = oldest_scene
+                break
+            oldest_scene.close_video_reader()
 
     def close_video_reader(self) -> None:
         if self._video_reader is not None:
             self._video_reader.close()
             self._video_reader = None
+        self._OPEN_VIDEO_SCENES.pop(id(self), None)
 
     def __del__(self) -> None:
         self.close_video_reader()
