@@ -541,15 +541,12 @@ def forward_training_pass(
     loss_region_mask = loss_region_mask * invisible_mask
     loss_region_mask = dilate_binary_mask(loss_region_mask, dilation_px=invisible_mask_dilation_px)
     gaussian_gate_mask = dilate_binary_mask(loss_region_mask, dilation_px=gaussian_mask_dilation_px)
-    gaussian_update_gate = compute_gaussian_invisible_gate(
-        gaussians_world=gaussians_world,
-        target_intrinsics=target_intrinsics,
-        target_extrinsics=target_extrinsics,
-        region_mask=gaussian_gate_mask,
-        num_layers=delta_values.shape[2],
-        grid_height=delta_values.shape[-2],
-        grid_width=delta_values.shape[-1],
+    gate_2d = F.interpolate(
+        gaussian_gate_mask,
+        size=(delta_values.shape[-2], delta_values.shape[-1]),
+        mode="nearest",
     )
+    gaussian_update_gate = gate_2d[:, :, None].expand(-1, 1, delta_values.shape[2], -1, -1)
     gated_delta_values = delta_values * gaussian_update_gate
     gaussians_ndc = predictor.gaussian_composer(
         delta=gated_delta_values,
@@ -818,18 +815,12 @@ def save_visualization_batch(
     """Save intermediate visualizations for debugging."""
     source_image = batch["source_image"]
     target_image = batch["target_image"]
-    source_original_image = batch["source_original_image"]
-    target_original_image = batch["target_original_image"]
     assert isinstance(source_image, torch.Tensor)
     assert isinstance(target_image, torch.Tensor)
-    assert isinstance(source_original_image, list)
-    assert isinstance(target_original_image, list)
 
     source_render = outputs["source_render"]
     target_render = outputs["target_render"]
     refined_target_render = outputs["refined_target_render"]
-    source_render_original = outputs["source_render_original"]
-    refined_target_render_original = outputs["refined_target_render_original"]
     invisible_mask = outputs["invisible_mask"]
     invisible_target_render = outputs["invisible_target_render"]
     loss_region_mask = outputs["loss_region_mask"]
@@ -838,8 +829,6 @@ def save_visualization_batch(
     assert isinstance(source_render, RenderingOutputs)
     assert isinstance(target_render, RenderingOutputs)
     assert isinstance(refined_target_render, RenderingOutputs)
-    assert isinstance(source_render_original, list)
-    assert isinstance(refined_target_render_original, list)
     assert isinstance(invisible_mask, torch.Tensor)
     assert isinstance(invisible_target_render, torch.Tensor)
     assert isinstance(loss_region_mask, torch.Tensor)
@@ -849,15 +838,9 @@ def save_visualization_batch(
     prefix = output_dir / f"step_{global_step:06d}"
     save_tensor_image(source_image[0], prefix.with_name(prefix.name + ".source.train.png"))
     save_tensor_image(target_image[0], prefix.with_name(prefix.name + ".target.train.png"))
-    save_tensor_image(source_original_image[0], prefix.with_name(prefix.name + ".source.png"))
-    save_tensor_image(target_original_image[0], prefix.with_name(prefix.name + ".target.png"))
     save_mask_image(invisible_mask[0], prefix.with_name(prefix.name + ".invisible_mask.png"))
     save_mask_image(loss_region_mask[0], prefix.with_name(prefix.name + ".loss_region_mask.png"))
-    save_mask_image(gaussian_gate_mask[0], prefix.with_name(prefix.name + ".gaussian_gate_mask.png"))
-    save_mask_image(
-        gaussian_update_gate[0, :, 0].max(dim=0, keepdim=True).values,
-        prefix.with_name(prefix.name + ".gaussian_update_gate.png"),
-    )
+    save_mask_image(gaussian_gate_mask[0], prefix.with_name(prefix.name + ".gaussian_update_gate.png"))
     save_tensor_image(
         (invisible_target_render[0]).clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".invisible_target_render.png"),
@@ -867,16 +850,8 @@ def save_visualization_batch(
         prefix.with_name(prefix.name + ".source_render.train.png"),
     )
     save_tensor_image(
-        source_render_original[0].color[0].clamp(0.0, 1.0),
-        prefix.with_name(prefix.name + ".source_render.png"),
-    )
-    save_tensor_image(
         refined_target_render.color[0].clamp(0.0, 1.0),
         prefix.with_name(prefix.name + ".target_render.train.png"),
-    )
-    save_tensor_image(
-        refined_target_render_original[0].color[0].clamp(0.0, 1.0),
-        prefix.with_name(prefix.name + ".target_render.png"),
     )
 
 
