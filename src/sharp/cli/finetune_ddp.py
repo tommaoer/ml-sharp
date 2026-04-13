@@ -68,6 +68,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
 @click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
+@click.option("--train-prediction-head/--freeze-prediction-head", default=True, show_default=True)
 @click.option("-v", "--verbose", is_flag=True, default=False)
 def finetune_ddp_cli(
     data_root: Path | None,
@@ -99,6 +100,7 @@ def finetune_ddp_cli(
     delta_hidden_dim: int,
     delta_geometry_scale: float,
     delta_texture_scale: float,
+    train_prediction_head: bool,
     verbose: bool,
 ) -> None:
     """DDP multi-GPU fine-tuning entrypoint (launch with torchrun)."""
@@ -131,6 +133,7 @@ def finetune_ddp_cli(
         delta_hidden_dim=delta_hidden_dim,
         delta_geometry_scale=delta_geometry_scale,
         delta_texture_scale=delta_texture_scale,
+        train_prediction_head=train_prediction_head,
     ).to(device_t)
     predictor.delta_decoder = DDP(
         predictor.delta_decoder,
@@ -207,6 +210,7 @@ def finetune_ddp_cli(
                 "delta_hidden_dim": delta_hidden_dim,
                 "delta_geometry_scale": delta_geometry_scale,
                 "delta_texture_scale": delta_texture_scale,
+                "train_prediction_head": train_prediction_head,
             },
         )
 

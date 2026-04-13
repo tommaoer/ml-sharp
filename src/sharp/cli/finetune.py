@@ -98,6 +98,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
 @click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
+@click.option("--train-prediction-head/--freeze-prediction-head", default=True, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.0, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
@@ -140,6 +141,7 @@ def finetune_cli(
     delta_hidden_dim: int,
     delta_geometry_scale: float,
     delta_texture_scale: float,
+    train_prediction_head: bool,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
     verbose: bool,
@@ -166,6 +168,7 @@ def finetune_cli(
         delta_hidden_dim=delta_hidden_dim,
         delta_geometry_scale=delta_geometry_scale,
         delta_texture_scale=delta_texture_scale,
+        train_prediction_head=train_prediction_head,
     ).to(device_t)
     internal_resolution = (1536, 1536)
     if data_root is not None:
@@ -224,6 +227,8 @@ def finetune_cli(
     ).to(device_t)
 
     trainable_module_names = ["delta_decoder"]
+    if train_prediction_head:
+        trainable_module_names.append("prediction_head")
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
     ]
@@ -272,6 +277,7 @@ def finetune_cli(
             "delta_hidden_dim": delta_hidden_dim,
             "delta_geometry_scale": delta_geometry_scale,
             "delta_texture_scale": delta_texture_scale,
+            "train_prediction_head": train_prediction_head,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
             "trainable_parameter_names": trainable_parameter_names,
@@ -407,6 +413,7 @@ def build_finetune_predictor(
     delta_hidden_dim: int,
     delta_geometry_scale: float,
     delta_texture_scale: float,
+    train_prediction_head: bool,
 ):
     """Create SHARP predictor and train a lightweight additive delta decoder."""
     params = PredictorParams()
@@ -423,6 +430,7 @@ def build_finetune_predictor(
         texture_scale=delta_texture_scale,
     )
     predictor.delta_decoder.requires_grad_(True)
+    predictor.prediction_head.requires_grad_(bool(train_prediction_head))
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
