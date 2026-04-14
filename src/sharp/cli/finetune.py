@@ -862,12 +862,17 @@ def batch_unproject_gaussians(
 
 def concat_gaussians(a: Gaussians3D, b: Gaussians3D) -> Gaussians3D:
     """Concatenate two Gaussian batches along Gaussian-count dimension."""
+    b_opacities = b.opacities
+    if a.opacities.ndim == 2 and b_opacities.ndim == 3 and b_opacities.shape[-1] == 1:
+        b_opacities = b_opacities.squeeze(-1)
+    elif a.opacities.ndim == 3 and b_opacities.ndim == 2:
+        b_opacities = b_opacities.unsqueeze(-1)
     return Gaussians3D(
         mean_vectors=torch.cat([a.mean_vectors, b.mean_vectors], dim=1),
         singular_values=torch.cat([a.singular_values, b.singular_values], dim=1),
         quaternions=torch.cat([a.quaternions, b.quaternions], dim=1),
         colors=torch.cat([a.colors, b.colors], dim=1),
-        opacities=torch.cat([a.opacities, b.opacities], dim=1),
+        opacities=torch.cat([a.opacities, b_opacities], dim=1),
     )
 
 
