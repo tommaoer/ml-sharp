@@ -118,7 +118,7 @@ If you only want to fine-tune on one video, you can still pass `--video-path` an
 
 If mask-focused improvement is too weak, increase `--invisible-mask-dilation-px` (expand supervised mask area) and/or `--invisible-loss-boost` (upweight mask-region reconstruction losses).
 The `--loss-border-ratio` controls the center-region crop before intersecting with the invisible-mask region. Set `--loss-border-ratio 0.0` to use the full image ∩ invisible-mask intersection.
-For harder overfit cases (single-scene, many steps), keep `--train-prediction-head` enabled to optimize both `delta_decoder` and `prediction_head` for sharper mask-region details.
+`--train-prediction-head` is optional (default: frozen). If you see global blur/drift, keep it frozen and train only `delta_decoder`; enable it only when mask-region detail is still insufficient.
 Depth files (`depth_sequence.npy`) are only loaded when `--depth-loss` is enabled.
 When `--depth-loss` is enabled, depth arrays are loaded lazily on demand (not at dataset init), which reduces long startup stalls on very large datasets.
 Video frames are also fetched on demand; enabling `--preload-video` now enables per-frame caching during sampling instead of reading the whole video at startup.

@@ -68,7 +68,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
 @click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
-@click.option("--train-prediction-head/--freeze-prediction-head", default=True, show_default=True)
+@click.option("--train-prediction-head/--freeze-prediction-head", default=False, show_default=True)
 @click.option("-v", "--verbose", is_flag=True, default=False)
 def finetune_ddp_cli(
     data_root: Path | None,
