@@ -98,6 +98,8 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
 @click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
+@click.option("--enable-invisible-gaussian-bank/--disable-invisible-gaussian-bank", default=False, show_default=True)
+@click.option("--invisible-gaussian-bank-size", type=int, default=1024, show_default=True)
 @click.option("--train-prediction-head/--freeze-prediction-head", default=False, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.0, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
@@ -141,6 +143,8 @@ def finetune_cli(
     delta_hidden_dim: int,
     delta_geometry_scale: float,
     delta_texture_scale: float,
+    enable_invisible_gaussian_bank: bool,
+    invisible_gaussian_bank_size: int,
     train_prediction_head: bool,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
@@ -168,6 +172,8 @@ def finetune_cli(
         delta_hidden_dim=delta_hidden_dim,
         delta_geometry_scale=delta_geometry_scale,
         delta_texture_scale=delta_texture_scale,
+        enable_invisible_gaussian_bank=enable_invisible_gaussian_bank,
+        invisible_gaussian_bank_size=invisible_gaussian_bank_size,
         train_prediction_head=train_prediction_head,
     ).to(device_t)
     internal_resolution = (1536, 1536)
@@ -227,6 +233,8 @@ def finetune_cli(
     ).to(device_t)
 
     trainable_module_names = ["delta_decoder"]
+    if enable_invisible_gaussian_bank:
+        trainable_module_names.append("invisible_gaussian_bank")
     if train_prediction_head:
         trainable_module_names.append("prediction_head")
     trainable_parameter_names = [
@@ -277,6 +285,8 @@ def finetune_cli(
             "delta_hidden_dim": delta_hidden_dim,
             "delta_geometry_scale": delta_geometry_scale,
             "delta_texture_scale": delta_texture_scale,
+            "enable_invisible_gaussian_bank": enable_invisible_gaussian_bank,
+            "invisible_gaussian_bank_size": invisible_gaussian_bank_size,
             "train_prediction_head": train_prediction_head,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
@@ -408,11 +418,41 @@ class LightweightDeltaDecoder(nn.Module):
         return delta * self.channel_scale
 
 
+class InvisibleGaussianBank(nn.Module):
+    """Scene-level learnable Gaussian bank for hard invisible regions."""
+
+    def __init__(self, num_gaussians: int) -> None:
+        super().__init__()
+        self.num_gaussians = int(max(0, num_gaussians))
+        self.mean_vectors = nn.Parameter(torch.randn(self.num_gaussians, 3) * 0.1)
+        self.mean_vectors.data[:, 2].add_(2.0)
+        self.log_scales = nn.Parameter(torch.full((self.num_gaussians, 3), -3.0))
+        self.raw_quaternions = nn.Parameter(torch.randn(self.num_gaussians, 4))
+        self.color_logits = nn.Parameter(torch.zeros(self.num_gaussians, 3))
+        self.opacity_logits = nn.Parameter(torch.full((self.num_gaussians, 1), -3.0))
+
+    def forward(self, batch_size: int) -> Gaussians3D:
+        mean_vectors = self.mean_vectors[None].expand(batch_size, -1, -1)
+        singular_values = torch.exp(self.log_scales)[None].expand(batch_size, -1, -1).clamp(min=1e-4)
+        quaternions = F.normalize(self.raw_quaternions, dim=-1)[None].expand(batch_size, -1, -1)
+        colors = torch.sigmoid(self.color_logits)[None].expand(batch_size, -1, -1)
+        opacities = torch.sigmoid(self.opacity_logits)[None].expand(batch_size, -1, -1)
+        return Gaussians3D(
+            mean_vectors=mean_vectors,
+            singular_values=singular_values,
+            quaternions=quaternions,
+            colors=colors,
+            opacities=opacities,
+        )
+
+
 def build_finetune_predictor(
     checkpoint_path: Path | None,
     delta_hidden_dim: int,
     delta_geometry_scale: float,
     delta_texture_scale: float,
+    enable_invisible_gaussian_bank: bool,
+    invisible_gaussian_bank_size: int,
     train_prediction_head: bool,
 ):
     """Create SHARP predictor and train a lightweight additive delta decoder."""
@@ -430,6 +470,9 @@ def build_finetune_predictor(
         texture_scale=delta_texture_scale,
     )
     predictor.delta_decoder.requires_grad_(True)
+    if enable_invisible_gaussian_bank:
+        predictor.invisible_gaussian_bank = InvisibleGaussianBank(invisible_gaussian_bank_size)
+        predictor.invisible_gaussian_bank.requires_grad_(True)
     predictor.prediction_head.requires_grad_(bool(train_prediction_head))
     predictor.train()
     predictor.monodepth_model.eval()
@@ -567,6 +610,9 @@ def forward_training_pass(
         source_intrinsics,
         image_shape,
     )
+    if hasattr(predictor, "invisible_gaussian_bank"):
+        bank_gaussians = predictor.invisible_gaussian_bank(batch_size=gaussians_world.mean_vectors.shape[0])
+        gaussians_world = concat_gaussians(gaussians_world, bank_gaussians)
     source_render = renderer(
         gaussians_world,
         source_extrinsics,
@@ -811,6 +857,17 @@ def batch_unproject_gaussians(
         quaternions=torch.cat([item.quaternions for item in items], dim=0),
         colors=torch.cat([item.colors for item in items], dim=0),
         opacities=torch.cat([item.opacities for item in items], dim=0),
+    )
+
+
+def concat_gaussians(a: Gaussians3D, b: Gaussians3D) -> Gaussians3D:
+    """Concatenate two Gaussian batches along Gaussian-count dimension."""
+    return Gaussians3D(
+        mean_vectors=torch.cat([a.mean_vectors, b.mean_vectors], dim=1),
+        singular_values=torch.cat([a.singular_values, b.singular_values], dim=1),
+        quaternions=torch.cat([a.quaternions, b.quaternions], dim=1),
+        colors=torch.cat([a.colors, b.colors], dim=1),
+        opacities=torch.cat([a.opacities, b.opacities], dim=1),
     )
 
 

@@ -68,6 +68,8 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
 @click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
 @click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
+@click.option("--enable-invisible-gaussian-bank/--disable-invisible-gaussian-bank", default=False, show_default=True)
+@click.option("--invisible-gaussian-bank-size", type=int, default=1024, show_default=True)
 @click.option("--train-prediction-head/--freeze-prediction-head", default=False, show_default=True)
 @click.option("-v", "--verbose", is_flag=True, default=False)
 def finetune_ddp_cli(
@@ -100,6 +102,8 @@ def finetune_ddp_cli(
     delta_hidden_dim: int,
     delta_geometry_scale: float,
     delta_texture_scale: float,
+    enable_invisible_gaussian_bank: bool,
+    invisible_gaussian_bank_size: int,
     train_prediction_head: bool,
     verbose: bool,
 ) -> None:
@@ -133,6 +137,8 @@ def finetune_ddp_cli(
         delta_hidden_dim=delta_hidden_dim,
         delta_geometry_scale=delta_geometry_scale,
         delta_texture_scale=delta_texture_scale,
+        enable_invisible_gaussian_bank=enable_invisible_gaussian_bank,
+        invisible_gaussian_bank_size=invisible_gaussian_bank_size,
         train_prediction_head=train_prediction_head,
     ).to(device_t)
     predictor.delta_decoder = DDP(
@@ -210,6 +216,8 @@ def finetune_ddp_cli(
                 "delta_hidden_dim": delta_hidden_dim,
                 "delta_geometry_scale": delta_geometry_scale,
                 "delta_texture_scale": delta_texture_scale,
+                "enable_invisible_gaussian_bank": enable_invisible_gaussian_bank,
+                "invisible_gaussian_bank_size": invisible_gaussian_bank_size,
                 "train_prediction_head": train_prediction_head,
             },
         )
