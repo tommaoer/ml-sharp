@@ -60,6 +60,9 @@ while tolerating architecture/key differences, use:
 sharp predict-finetune -i /path/to/input/images -o /path/to/output/gaussians -c /path/to/finetune_checkpoint.pt
 ```
 
+If your checkpoint contains an `invisible_gaussian_bank`, it is used by default (`--use-bank`).
+You can disable it for baseline comparison via `--ignore-bank`.
+
 `predict-finetune` uses `delta_decoder.*` by default so finetuned deltas participate in inference.
 If you want baseline comparison behavior, pass `--ignore-delta`.
 
