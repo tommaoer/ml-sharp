@@ -100,6 +100,12 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
 @click.option("--enable-invisible-gaussian-bank/--disable-invisible-gaussian-bank", default=False, show_default=True)
 @click.option("--invisible-gaussian-bank-size", type=int, default=1024, show_default=True)
+@click.option(
+    "--bank-only/--no-bank-only",
+    default=False,
+    show_default=True,
+    help="Only optimize invisible_gaussian_bank and keep original SHARP-predicted Gaussians fixed.",
+)
 @click.option("--train-prediction-head/--freeze-prediction-head", default=False, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.0, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
@@ -145,6 +151,7 @@ def finetune_cli(
     delta_texture_scale: float,
     enable_invisible_gaussian_bank: bool,
     invisible_gaussian_bank_size: int,
+    bank_only: bool,
     train_prediction_head: bool,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
@@ -174,6 +181,7 @@ def finetune_cli(
         delta_texture_scale=delta_texture_scale,
         enable_invisible_gaussian_bank=enable_invisible_gaussian_bank,
         invisible_gaussian_bank_size=invisible_gaussian_bank_size,
+        bank_only=bank_only,
         train_prediction_head=train_prediction_head,
     ).to(device_t)
     internal_resolution = (1536, 1536)
@@ -237,6 +245,11 @@ def finetune_cli(
         trainable_module_names.append("invisible_gaussian_bank")
     if train_prediction_head:
         trainable_module_names.append("prediction_head")
+    trainable_module_names = [
+        name
+        for name in trainable_module_names
+        if any(param.requires_grad for _, param in getattr(predictor, name).named_parameters())
+    ]
     trainable_parameter_names = [
         f"predictor.{name}" for name, param in predictor.named_parameters() if param.requires_grad
     ]
@@ -287,6 +300,7 @@ def finetune_cli(
             "delta_texture_scale": delta_texture_scale,
             "enable_invisible_gaussian_bank": enable_invisible_gaussian_bank,
             "invisible_gaussian_bank_size": invisible_gaussian_bank_size,
+            "bank_only": bank_only,
             "train_prediction_head": train_prediction_head,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
