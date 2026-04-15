@@ -43,6 +43,16 @@ class Gaussians3D(NamedTuple):
             opacities=self.opacities.to(device),
         )
 
+    def detach(self) -> Gaussians3D:
+        """Detach all Gaussian tensors from autograd graph."""
+        return Gaussians3D(
+            mean_vectors=self.mean_vectors.detach(),
+            singular_values=self.singular_values.detach(),
+            quaternions=self.quaternions.detach(),
+            colors=self.colors.detach(),
+            opacities=self.opacities.detach(),
+        )
+
 
 class SceneMetaData(NamedTuple):
     """Meta data about Gaussian scene."""
