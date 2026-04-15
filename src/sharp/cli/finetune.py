@@ -161,6 +161,13 @@ def finetune_cli(
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
     if data_root is None and (video_path is None or pose_path is None):
         raise click.UsageError("Please provide --data-root or both --video-path and --pose-path.")
+    if bank_only and not enable_invisible_gaussian_bank:
+        raise click.UsageError("--bank-only requires --enable-invisible-gaussian-bank.")
+    if bank_only and train_prediction_head:
+        LOGGER.warning(
+            "--bank-only is enabled; ignoring --train-prediction-head to keep original SHARP predictor frozen."
+        )
+        train_prediction_head = False
 
     output_dir.mkdir(parents=True, exist_ok=True)
     visualization_dir = output_dir / "visualizations"
@@ -397,6 +404,78 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def safe_logit(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Numerically stable inverse-sigmoid."""
+    value = value.clamp(min=eps, max=1.0 - eps)
+    return torch.log(value) - torch.log1p(-value)
+
+
+def select_invisible_gaussians(
+    reference_gaussians: Gaussians3D,
+    target_intrinsics: torch.Tensor,
+    target_extrinsics: torch.Tensor,
+    invisible_mask: torch.Tensor,
+    requested_count: int,
+) -> torch.Tensor:
+    """Select flattened Gaussian indices whose target projections fall in invisible areas."""
+    batch_size, num_gaussians, _ = reference_gaussians.mean_vectors.shape
+    if requested_count <= 0 or num_gaussians == 0:
+        return torch.empty((0, 2), dtype=torch.long, device=reference_gaussians.mean_vectors.device)
+
+    means_world = torch.cat(
+        [
+            reference_gaussians.mean_vectors,
+            torch.ones(batch_size, num_gaussians, 1, device=reference_gaussians.mean_vectors.device),
+        ],
+        dim=-1,
+    )
+    means_target = means_world @ target_extrinsics.transpose(-1, -2)
+    means_target = means_target[..., :3]
+
+    z = means_target[..., 2].clamp(min=1e-6)
+    u = target_intrinsics[:, 0, 0][:, None] * (means_target[..., 0] / z) + target_intrinsics[:, 0, 2][:, None]
+    v = target_intrinsics[:, 1, 1][:, None] * (means_target[..., 1] / z) + target_intrinsics[:, 1, 2][:, None]
+    norm_u = 2.0 * (u / max(invisible_mask.shape[-1] - 1, 1)) - 1.0
+    norm_v = 2.0 * (v / max(invisible_mask.shape[-2] - 1, 1)) - 1.0
+    grid = torch.stack([norm_u, norm_v], dim=-1).view(batch_size, num_gaussians, 1, 2)
+    sampled_mask = F.grid_sample(
+        invisible_mask,
+        grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=True,
+    ).view(batch_size, num_gaussians)
+    valid = (means_target[..., 2] > 1e-4) & (sampled_mask > 0.5)
+    candidates = valid.nonzero(as_tuple=False)
+    if candidates.numel() == 0:
+        candidate_batch = torch.arange(batch_size, device=reference_gaussians.mean_vectors.device).repeat_interleave(
+            num_gaussians
+        )
+        candidate_index = torch.arange(num_gaussians, device=reference_gaussians.mean_vectors.device).repeat(
+            batch_size
+        )
+        candidates = torch.stack([candidate_batch, candidate_index], dim=-1)
+    if candidates.shape[0] >= requested_count:
+        picked = torch.randperm(candidates.shape[0], device=candidates.device)[:requested_count]
+        return candidates[picked]
+    repeats = (requested_count + candidates.shape[0] - 1) // candidates.shape[0]
+    tiled = candidates.repeat(repeats, 1)
+    return tiled[:requested_count]
+
+
+def gather_flat_gaussians(gaussians: Gaussians3D, flat_indices: torch.Tensor) -> Gaussians3D:
+    """Gather `(batch_index, gaussian_index)` entries into a flat Gaussian set."""
+    batch_idx = flat_indices[:, 0]
+    gaussian_idx = flat_indices[:, 1]
+    return Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[batch_idx, gaussian_idx],
+        singular_values=gaussians.singular_values[batch_idx, gaussian_idx],
+        quaternions=gaussians.quaternions[batch_idx, gaussian_idx],
+        colors=gaussians.colors[batch_idx, gaussian_idx],
+        opacities=gaussians.opacities[batch_idx, gaussian_idx],
+    )
+
+
 class LightweightDeltaDecoder(nn.Module):
     """Lightweight residual decoder that predicts additive gaussian deltas."""
 
@@ -438,19 +517,61 @@ class InvisibleGaussianBank(nn.Module):
     def __init__(self, num_gaussians: int) -> None:
         super().__init__()
         self.num_gaussians = int(max(0, num_gaussians))
-        self.mean_vectors = nn.Parameter(torch.randn(self.num_gaussians, 3) * 0.1)
-        self.mean_vectors.data[:, 2].add_(2.0)
-        self.log_scales = nn.Parameter(torch.full((self.num_gaussians, 3), -3.0))
-        self.raw_quaternions = nn.Parameter(torch.randn(self.num_gaussians, 4))
+        self.mean_vectors = nn.Parameter(torch.zeros(self.num_gaussians, 3))
+        self.log_scales = nn.Parameter(torch.zeros(self.num_gaussians, 3))
+        self.raw_quaternions = nn.Parameter(torch.zeros(self.num_gaussians, 4))
         self.color_logits = nn.Parameter(torch.zeros(self.num_gaussians, 3))
-        self.opacity_logits = nn.Parameter(torch.full((self.num_gaussians, 1), -3.0))
+        self.opacity_logits = nn.Parameter(torch.zeros(self.num_gaussians, 1))
+        self.register_buffer("base_mean_vectors", torch.zeros(self.num_gaussians, 3))
+        self.register_buffer("base_log_scales", torch.full((self.num_gaussians, 3), -3.0))
+        self.register_buffer("base_raw_quaternions", torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(self.num_gaussians, 1))
+        self.register_buffer("base_color_logits", torch.zeros(self.num_gaussians, 3))
+        self.register_buffer("base_opacity_logits", torch.full((self.num_gaussians, 1), -3.0))
+        self.register_buffer("_initialized", torch.tensor(False), persistent=False)
+
+    def initialize_from_reference(
+        self,
+        reference_gaussians: Gaussians3D,
+        target_intrinsics: torch.Tensor,
+        target_extrinsics: torch.Tensor,
+        invisible_mask: torch.Tensor,
+    ) -> None:
+        """Initialize bank base values from Gaussians projected into invisible regions."""
+        if self.num_gaussians == 0:
+            return
+        with torch.no_grad():
+            selected_indices = select_invisible_gaussians(
+                reference_gaussians=reference_gaussians,
+                target_intrinsics=target_intrinsics,
+                target_extrinsics=target_extrinsics,
+                invisible_mask=invisible_mask,
+                requested_count=self.num_gaussians,
+            )
+            if selected_indices.numel() == 0:
+                return
+
+            selected = gather_flat_gaussians(reference_gaussians, selected_indices)
+            self.base_mean_vectors.copy_(selected.mean_vectors)
+            self.base_log_scales.copy_(selected.singular_values.clamp(min=1e-6).log())
+            self.base_raw_quaternions.copy_(selected.quaternions)
+            self.base_color_logits.copy_(safe_logit(selected.colors))
+            self.base_opacity_logits.copy_(safe_logit(selected.opacities))
+            self.mean_vectors.zero_()
+            self.log_scales.zero_()
+            self.raw_quaternions.zero_()
+            self.color_logits.zero_()
+            self.opacity_logits.zero_()
+            self._initialized.fill_(True)
 
     def forward(self, batch_size: int) -> Gaussians3D:
-        mean_vectors = self.mean_vectors[None].expand(batch_size, -1, -1)
-        singular_values = torch.exp(self.log_scales)[None].expand(batch_size, -1, -1).clamp(min=1e-4)
-        quaternions = F.normalize(self.raw_quaternions, dim=-1)[None].expand(batch_size, -1, -1)
-        colors = torch.sigmoid(self.color_logits)[None].expand(batch_size, -1, -1)
-        opacities = torch.sigmoid(self.opacity_logits)[None].expand(batch_size, -1, -1)
+        mean_vectors = (self.base_mean_vectors + self.mean_vectors)[None].expand(batch_size, -1, -1)
+        singular_values = torch.exp(self.base_log_scales + self.log_scales)[None].expand(batch_size, -1, -1)
+        singular_values = singular_values.clamp(min=1e-4)
+        quaternions = F.normalize(self.base_raw_quaternions + self.raw_quaternions, dim=-1)[None].expand(
+            batch_size, -1, -1
+        )
+        colors = torch.sigmoid(self.base_color_logits + self.color_logits)[None].expand(batch_size, -1, -1)
+        opacities = torch.sigmoid(self.base_opacity_logits + self.opacity_logits)[None].expand(batch_size, -1, -1)
         return Gaussians3D(
             mean_vectors=mean_vectors,
             singular_values=singular_values,
@@ -467,6 +588,7 @@ def build_finetune_predictor(
     delta_texture_scale: float,
     enable_invisible_gaussian_bank: bool,
     invisible_gaussian_bank_size: int,
+    bank_only: bool,
     train_prediction_head: bool,
 ):
     """Create SHARP predictor and train a lightweight additive delta decoder."""
@@ -483,11 +605,12 @@ def build_finetune_predictor(
         geometry_scale=delta_geometry_scale,
         texture_scale=delta_texture_scale,
     )
-    predictor.delta_decoder.requires_grad_(True)
+    predictor.delta_decoder.requires_grad_(not bank_only)
     if enable_invisible_gaussian_bank:
         predictor.invisible_gaussian_bank = InvisibleGaussianBank(invisible_gaussian_bank_size)
         predictor.invisible_gaussian_bank.requires_grad_(True)
-    predictor.prediction_head.requires_grad_(bool(train_prediction_head))
+    predictor.prediction_head.requires_grad_(bool(train_prediction_head) and not bank_only)
+    predictor.bank_only = bool(bank_only)
     predictor.train()
     predictor.monodepth_model.eval()
     predictor.init_model.eval()
@@ -573,7 +696,8 @@ def forward_training_pass(
         encodings=monodepth_output.output_features,
     )
     delta_values = predictor.prediction_head(image_features)
-    delta_values = delta_values + predictor.delta_decoder(image_features)
+    if not getattr(predictor, "bank_only", False):
+        delta_values = delta_values + predictor.delta_decoder(image_features)
     gaussians_ndc = predictor.gaussian_composer(
         delta=delta_values,
         base_values=init_output.gaussian_base_values,
@@ -612,19 +736,29 @@ def forward_training_pass(
         mode="nearest",
     )
     gaussian_update_gate = gate_2d[:, :, None].expand(-1, 1, delta_values.shape[2], -1, -1)
-    gated_delta_values = delta_values * gaussian_update_gate
-    gaussians_ndc = predictor.gaussian_composer(
-        delta=gated_delta_values,
-        base_values=init_output.gaussian_base_values,
-        global_scale=init_output.global_scale,
-    )
-    gaussians_world = batch_unproject_gaussians(
-        gaussians_ndc,
-        source_extrinsics,
-        source_intrinsics,
-        image_shape,
-    )
+    if getattr(predictor, "bank_only", False):
+        gated_delta_values = torch.zeros_like(delta_values)
+    else:
+        gated_delta_values = delta_values * gaussian_update_gate
+        gaussians_ndc = predictor.gaussian_composer(
+            delta=gated_delta_values,
+            base_values=init_output.gaussian_base_values,
+            global_scale=init_output.global_scale,
+        )
+        gaussians_world = batch_unproject_gaussians(
+            gaussians_ndc,
+            source_extrinsics,
+            source_intrinsics,
+            image_shape,
+        )
     if hasattr(predictor, "invisible_gaussian_bank"):
+        if not predictor.invisible_gaussian_bank._initialized.item():
+            predictor.invisible_gaussian_bank.initialize_from_reference(
+                reference_gaussians=gaussians_world.detach(),
+                target_intrinsics=target_intrinsics,
+                target_extrinsics=target_extrinsics,
+                invisible_mask=loss_region_mask,
+            )
         bank_gaussians = predictor.invisible_gaussian_bank(batch_size=gaussians_world.mean_vectors.shape[0])
         gaussians_world = concat_gaussians(gaussians_world, bank_gaussians)
     source_render = renderer(

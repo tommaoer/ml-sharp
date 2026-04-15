@@ -139,6 +139,7 @@ def finetune_ddp_cli(
         delta_texture_scale=delta_texture_scale,
         enable_invisible_gaussian_bank=enable_invisible_gaussian_bank,
         invisible_gaussian_bank_size=invisible_gaussian_bank_size,
+        bank_only=False,
         train_prediction_head=train_prediction_head,
     ).to(device_t)
     predictor.delta_decoder = DDP(
