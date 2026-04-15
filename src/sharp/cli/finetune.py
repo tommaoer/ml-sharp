@@ -551,11 +551,17 @@ class InvisibleGaussianBank(nn.Module):
                 return
 
             selected = gather_flat_gaussians(reference_gaussians, selected_indices)
+            selected_colors = selected.colors
+            selected_opacities = selected.opacities
+            if selected_colors.ndim == 1:
+                selected_colors = selected_colors[:, None]
+            if selected_opacities.ndim == 1:
+                selected_opacities = selected_opacities[:, None]
             self.base_mean_vectors.copy_(selected.mean_vectors)
             self.base_log_scales.copy_(selected.singular_values.clamp(min=1e-6).log())
             self.base_raw_quaternions.copy_(selected.quaternions)
-            self.base_color_logits.copy_(safe_logit(selected.colors))
-            self.base_opacity_logits.copy_(safe_logit(selected.opacities))
+            self.base_color_logits.copy_(safe_logit(selected_colors))
+            self.base_opacity_logits.copy_(safe_logit(selected_opacities))
             self.mean_vectors.zero_()
             self.log_scales.zero_()
             self.raw_quaternions.zero_()
