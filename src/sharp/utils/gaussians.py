@@ -172,15 +172,10 @@ def decompose_covariance_matrices(
         if not _HAS_LOGGED_SVD_REFLECTION_WARNING:
             LOGGER.warning(
                 "Received %d reflection matrices from SVD. Flipping them to rotations. "
-                "Subsequent reflection counts will be logged at DEBUG level.",
+                "This warning is shown only once to avoid log spam.",
                 num_reflections,
             )
             _HAS_LOGGED_SVD_REFLECTION_WARNING = True
-        else:
-            LOGGER.debug(
-                "Received %d reflection matrices from SVD. Flipping them to rotations.",
-                num_reflections,
-            )
         # Flip the last column of reflection and make it a rotation.
         rotations[reflection_mask, :, -1] *= -1
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
