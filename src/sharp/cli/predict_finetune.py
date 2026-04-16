@@ -122,6 +122,7 @@ def predict_finetune_cli(
         state_dict = strip_delta_decoder_keys(state_dict)
     if has_invisible_bank and use_bank:
         add_invisible_bank_from_checkpoint(gaussian_predictor, state_dict)
+        state_dict = upgrade_legacy_invisible_bank_state_dict(state_dict)
     elif has_invisible_bank and not use_bank:
         state_dict = strip_invisible_bank_keys(state_dict)
 
@@ -250,6 +251,35 @@ def add_invisible_bank_from_checkpoint(predictor, state_dict: dict[str, Any]) ->
     bank_size = int(means.shape[0])
     predictor.invisible_gaussian_bank = InvisibleGaussianBank(bank_size)
     LOGGER.info("Attached invisible_gaussian_bank for inference (size=%d).", bank_size)
+
+
+def upgrade_legacy_invisible_bank_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade old invisible bank checkpoints (absolute params) to base+residual format."""
+    mean_key = "invisible_gaussian_bank.mean_vectors"
+    if mean_key not in state_dict:
+        return state_dict
+    base_mean_key = "invisible_gaussian_bank.base_mean_vectors"
+    if base_mean_key in state_dict:
+        return state_dict
+
+    LOGGER.info("Upgrading legacy invisible_gaussian_bank checkpoint to base+residual format.")
+    upgraded = dict(state_dict)
+    mapping = {
+        "mean_vectors": "base_mean_vectors",
+        "log_scales": "base_log_scales",
+        "raw_quaternions": "base_raw_quaternions",
+        "color_logits": "base_color_logits",
+        "opacity_logits": "base_opacity_logits",
+    }
+    for param_name, base_name in mapping.items():
+        param_key = f"invisible_gaussian_bank.{param_name}"
+        base_key = f"invisible_gaussian_bank.{base_name}"
+        param_value = upgraded.get(param_key)
+        if param_value is None:
+            continue
+        upgraded[base_key] = param_value.clone()
+        upgraded[param_key] = torch.zeros_like(param_value)
+    return upgraded
 
 
 def predict_image_with_delta(predictor, image, f_px: float, device: torch.device):
