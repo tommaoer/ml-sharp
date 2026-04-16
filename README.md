@@ -60,9 +60,6 @@ while tolerating architecture/key differences, use:
 sharp predict-finetune -i /path/to/input/images -o /path/to/output/gaussians -c /path/to/finetune_checkpoint.pt
 ```
 
-If your checkpoint contains an `invisible_gaussian_bank`, it is used by default (`--use-bank`).
-You can disable it for baseline comparison via `--ignore-bank`.
-
 `predict-finetune` uses `delta_decoder.*` by default so finetuned deltas participate in inference.
 If you want baseline comparison behavior, pass `--ignore-delta`.
 
@@ -121,8 +118,7 @@ If you only want to fine-tune on one video, you can still pass `--video-path` an
 
 If mask-focused improvement is too weak, increase `--invisible-mask-dilation-px` (expand supervised mask area) and/or `--invisible-loss-boost` (upweight mask-region reconstruction losses).
 The `--loss-border-ratio` controls the center-region crop before intersecting with the invisible-mask region. Set `--loss-border-ratio 0.0` to use the full image ∩ invisible-mask intersection.
-`--train-prediction-head` is optional (default: frozen). If you see global blur/drift, keep it frozen and train only `delta_decoder`; enable it only when mask-region detail is still insufficient.
-For severe invisible-region gaps, you can enable a scene-level additive Gaussian bank with `--enable-invisible-gaussian-bank --invisible-gaussian-bank-size 1024` so training can optimize newly introduced Gaussians in addition to updating existing ones.
+For harder overfit cases (single-scene, many steps), keep `--train-prediction-head` enabled to optimize both `delta_decoder` and `prediction_head` for sharper mask-region details.
 Depth files (`depth_sequence.npy`) are only loaded when `--depth-loss` is enabled.
 When `--depth-loss` is enabled, depth arrays are loaded lazily on demand (not at dataset init), which reduces long startup stalls on very large datasets.
 Video frames are also fetched on demand; enabling `--preload-video` now enables per-frame caching during sampling instead of reading the whole video at startup.

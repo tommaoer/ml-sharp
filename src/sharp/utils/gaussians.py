@@ -43,16 +43,6 @@ class Gaussians3D(NamedTuple):
             opacities=self.opacities.to(device),
         )
 
-    def detach(self) -> Gaussians3D:
-        """Detach all Gaussian tensors from autograd graph."""
-        return Gaussians3D(
-            mean_vectors=self.mean_vectors.detach(),
-            singular_values=self.singular_values.detach(),
-            quaternions=self.quaternions.detach(),
-            colors=self.colors.detach(),
-            opacities=self.opacities.detach(),
-        )
-
 
 class SceneMetaData(NamedTuple):
     """Meta data about Gaussian scene."""
@@ -172,10 +162,15 @@ def decompose_covariance_matrices(
         if not _HAS_LOGGED_SVD_REFLECTION_WARNING:
             LOGGER.warning(
                 "Received %d reflection matrices from SVD. Flipping them to rotations. "
-                "This warning is shown only once to avoid log spam.",
+                "Subsequent reflection counts will be logged at DEBUG level.",
                 num_reflections,
             )
             _HAS_LOGGED_SVD_REFLECTION_WARNING = True
+        else:
+            LOGGER.debug(
+                "Received %d reflection matrices from SVD. Flipping them to rotations.",
+                num_reflections,
+            )
         # Flip the last column of reflection and make it a rotation.
         rotations[reflection_mask, :, -1] *= -1
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
