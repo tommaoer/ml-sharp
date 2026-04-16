@@ -455,12 +455,10 @@ def select_invisible_gaussians(
             batch_size
         )
         candidates = torch.stack([candidate_batch, candidate_index], dim=-1)
-    if candidates.shape[0] >= requested_count:
-        picked = torch.randperm(candidates.shape[0], device=candidates.device)[:requested_count]
-        return candidates[picked]
-    repeats = (requested_count + candidates.shape[0] - 1) // candidates.shape[0]
-    tiled = candidates.repeat(repeats, 1)
-    return tiled[:requested_count]
+    if candidates.shape[0] <= requested_count:
+        return candidates
+    picked = torch.randperm(candidates.shape[0], device=candidates.device)[:requested_count]
+    return candidates[picked]
 
 
 def gather_flat_gaussians(gaussians: Gaussians3D, flat_indices: torch.Tensor) -> Gaussians3D:
@@ -547,21 +545,34 @@ class InvisibleGaussianBank(nn.Module):
                 invisible_mask=invisible_mask,
                 requested_count=self.num_gaussians,
             )
-            if selected_indices.numel() == 0:
-                return
+            # Initialize all bank slots as inactive placeholders first. If there are
+            # fewer valid invisible-region candidates than `num_gaussians`, the
+            # remaining slots stay near-transparent instead of duplicating Gaussians.
+            self.base_mean_vectors.zero_()
+            self.base_mean_vectors[:, 2].fill_(2.0)
+            self.base_log_scales.fill_(-3.0)
+            self.base_raw_quaternions.zero_()
+            self.base_raw_quaternions[:, 0].fill_(1.0)
+            self.base_color_logits.zero_()
+            self.base_opacity_logits.fill_(-8.0)
 
-            selected = gather_flat_gaussians(reference_gaussians, selected_indices)
-            selected_colors = selected.colors
-            selected_opacities = selected.opacities
-            if selected_colors.ndim == 1:
-                selected_colors = selected_colors[:, None]
-            if selected_opacities.ndim == 1:
-                selected_opacities = selected_opacities[:, None]
-            self.base_mean_vectors.copy_(selected.mean_vectors)
-            self.base_log_scales.copy_(selected.singular_values.clamp(min=1e-6).log())
-            self.base_raw_quaternions.copy_(selected.quaternions)
-            self.base_color_logits.copy_(safe_logit(selected_colors))
-            self.base_opacity_logits.copy_(safe_logit(selected_opacities))
+            if selected_indices.numel() > 0:
+                selected = gather_flat_gaussians(reference_gaussians, selected_indices)
+                selected_colors = selected.colors
+                selected_opacities = selected.opacities
+                if selected_colors.ndim == 1:
+                    selected_colors = selected_colors[:, None]
+                if selected_opacities.ndim == 1:
+                    selected_opacities = selected_opacities[:, None]
+                selected_count = selected.mean_vectors.shape[0]
+                self.base_mean_vectors[:selected_count].copy_(selected.mean_vectors)
+                self.base_log_scales[:selected_count].copy_(selected.singular_values.clamp(min=1e-6).log())
+                self.base_raw_quaternions[:selected_count].copy_(selected.quaternions)
+                self.base_color_logits[:selected_count].copy_(safe_logit(selected_colors))
+                # Keep initial bank opacity conservative to avoid immediate "white fog".
+                self.base_opacity_logits[:selected_count].copy_(
+                    safe_logit(selected_opacities.clamp(min=1e-6, max=0.2))
+                )
             self.mean_vectors.zero_()
             self.log_scales.zero_()
             self.raw_quaternions.zero_()
