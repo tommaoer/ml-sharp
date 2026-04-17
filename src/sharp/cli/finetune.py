@@ -15,7 +15,6 @@ import click
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import DataLoader
 
 from sharp.cli.predict import DEFAULT_MODEL_URL
@@ -95,10 +94,7 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--invisible-mask-dilation-px", type=int, default=6, show_default=True)
 @click.option("--invisible-loss-boost", type=float, default=1.5, show_default=True)
 @click.option("--gaussian-mask-dilation-px", type=int, default=8, show_default=True)
-@click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
-@click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
-@click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
-@click.option("--train-prediction-head/--freeze-prediction-head", default=True, show_default=True)
+@click.option("--train-prediction-head/--freeze-prediction-head", default=False, show_default=True)
 @click.option("--loss-border-ratio", type=float, default=0.0, show_default=True)
 @click.option("--low-pass-filter-eps", type=float, default=0.0, show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
@@ -138,9 +134,6 @@ def finetune_cli(
     invisible_mask_dilation_px: int,
     invisible_loss_boost: float,
     gaussian_mask_dilation_px: int,
-    delta_hidden_dim: int,
-    delta_geometry_scale: float,
-    delta_texture_scale: float,
     train_prediction_head: bool,
     loss_border_ratio: float,
     low_pass_filter_eps: float,
@@ -165,9 +158,6 @@ def finetune_cli(
 
     predictor = build_finetune_predictor(
         checkpoint_path,
-        delta_hidden_dim=delta_hidden_dim,
-        delta_geometry_scale=delta_geometry_scale,
-        delta_texture_scale=delta_texture_scale,
         train_prediction_head=train_prediction_head,
     ).to(device_t)
     internal_resolution = (1536, 1536)
@@ -226,7 +216,7 @@ def finetune_cli(
         use_perceptual=perceptual,
     ).to(device_t)
 
-    trainable_module_names = ["delta_decoder"]
+    trainable_module_names = []
     if train_prediction_head:
         trainable_module_names.append("prediction_head")
     trainable_parameter_names = [
@@ -235,6 +225,10 @@ def finetune_cli(
     trainable_parameter_count = sum(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     )
+    if trainable_parameter_count == 0:
+        raise click.UsageError(
+            "No trainable parameters selected. Use --train-prediction-head to enable fine-tuning."
+        )
     LOGGER.info(
         "Optimizing modules: %s (%d parameters)",
         ", ".join(trainable_module_names),
@@ -274,9 +268,6 @@ def finetune_cli(
             "invisible_mask_dilation_px": invisible_mask_dilation_px,
             "invisible_loss_boost": invisible_loss_boost,
             "gaussian_mask_dilation_px": gaussian_mask_dilation_px,
-            "delta_hidden_dim": delta_hidden_dim,
-            "delta_geometry_scale": delta_geometry_scale,
-            "delta_texture_scale": delta_texture_scale,
             "train_prediction_head": train_prediction_head,
             "trainable_modules": trainable_module_names,
             "trainable_parameter_count": trainable_parameter_count,
@@ -373,63 +364,15 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-class LightweightDeltaDecoder(nn.Module):
-    """Lightweight residual decoder that predicts additive gaussian deltas."""
-
-    def __init__(
-        self,
-        feature_dim: int,
-        num_layers: int,
-        hidden_dim: int = 64,
-        geometry_scale: float = 0.05,
-        texture_scale: float = 1.0,
-    ) -> None:
-        super().__init__()
-        in_channels = feature_dim * 2
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, 14 * num_layers, kernel_size=1),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-        channel_scale = torch.full((14,), float(texture_scale), dtype=torch.float32)
-        channel_scale[0:3] = float(geometry_scale)
-        self.register_buffer("channel_scale", channel_scale.view(1, 14, 1, 1, 1))
-        self.num_layers = num_layers
-
-    def forward(self, image_features) -> torch.Tensor:
-        features = torch.cat(
-            [image_features.geometry_features, image_features.texture_features], dim=1
-        )
-        delta = self.net(features).unflatten(1, (14, self.num_layers))
-        return delta * self.channel_scale
-
-
 def build_finetune_predictor(
     checkpoint_path: Path | None,
-    delta_hidden_dim: int,
-    delta_geometry_scale: float,
-    delta_texture_scale: float,
     train_prediction_head: bool,
 ):
-    """Create SHARP predictor and train a lightweight additive delta decoder."""
+    """Create SHARP predictor and configure trainable submodules for finetuning."""
     params = PredictorParams()
     predictor = create_predictor(params)
     predictor.load_state_dict(load_pretrained_weights(checkpoint_path))
     predictor.requires_grad_(False)
-    feature_dim = predictor.prediction_head.geometry_prediction_head.in_channels
-    num_layers = predictor.prediction_head.num_layers
-    predictor.delta_decoder = LightweightDeltaDecoder(
-        feature_dim=feature_dim,
-        num_layers=num_layers,
-        hidden_dim=delta_hidden_dim,
-        geometry_scale=delta_geometry_scale,
-        texture_scale=delta_texture_scale,
-    )
-    predictor.delta_decoder.requires_grad_(True)
     predictor.prediction_head.requires_grad_(bool(train_prediction_head))
     predictor.train()
     predictor.monodepth_model.eval()
@@ -516,7 +459,6 @@ def forward_training_pass(
         encodings=monodepth_output.output_features,
     )
     delta_values = predictor.prediction_head(image_features)
-    delta_values = delta_values + predictor.delta_decoder(image_features)
     gaussians_ndc = predictor.gaussian_composer(
         delta=delta_values,
         base_values=init_output.gaussian_base_values,
