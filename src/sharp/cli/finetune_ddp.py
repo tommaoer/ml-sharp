@@ -65,11 +65,6 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--invisible-mask-dilation-px", type=int, default=6, show_default=True)
 @click.option("--invisible-loss-boost", type=float, default=1.5, show_default=True)
 @click.option("--gaussian-mask-dilation-px", type=int, default=8, show_default=True)
-@click.option("--delta-hidden-dim", type=int, default=64, show_default=True)
-@click.option("--delta-geometry-scale", type=float, default=0.05, show_default=True)
-@click.option("--delta-texture-scale", type=float, default=1.0, show_default=True)
-@click.option("--enable-invisible-gaussian-bank/--disable-invisible-gaussian-bank", default=False, show_default=True)
-@click.option("--invisible-gaussian-bank-size", type=int, default=1024, show_default=True)
 @click.option("--train-prediction-head/--freeze-prediction-head", default=False, show_default=True)
 @click.option("-v", "--verbose", is_flag=True, default=False)
 def finetune_ddp_cli(
@@ -99,11 +94,6 @@ def finetune_ddp_cli(
     invisible_mask_dilation_px: int,
     invisible_loss_boost: float,
     gaussian_mask_dilation_px: int,
-    delta_hidden_dim: int,
-    delta_geometry_scale: float,
-    delta_texture_scale: float,
-    enable_invisible_gaussian_bank: bool,
-    invisible_gaussian_bank_size: int,
     train_prediction_head: bool,
     verbose: bool,
 ) -> None:
@@ -134,16 +124,10 @@ def finetune_ddp_cli(
 
     predictor = build_finetune_predictor(
         checkpoint_path,
-        delta_hidden_dim=delta_hidden_dim,
-        delta_geometry_scale=delta_geometry_scale,
-        delta_texture_scale=delta_texture_scale,
-        enable_invisible_gaussian_bank=enable_invisible_gaussian_bank,
-        invisible_gaussian_bank_size=invisible_gaussian_bank_size,
-        bank_only=False,
         train_prediction_head=train_prediction_head,
     ).to(device_t)
-    predictor.delta_decoder = DDP(
-        predictor.delta_decoder,
+    predictor = DDP(
+        predictor,
         device_ids=[local_rank],
         output_device=local_rank,
         find_unused_parameters=False,
@@ -195,6 +179,10 @@ def finetune_ddp_cli(
     ).to(device_t)
 
     trainable_parameters = [p for p in predictor.parameters() if p.requires_grad]
+    if not trainable_parameters:
+        raise click.UsageError(
+            "No trainable parameters selected. Use --train-prediction-head to enable fine-tuning."
+        )
     optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     if is_main_process:
@@ -214,11 +202,6 @@ def finetune_ddp_cli(
                 "invisible_mask_dilation_px": invisible_mask_dilation_px,
                 "invisible_loss_boost": invisible_loss_boost,
                 "gaussian_mask_dilation_px": gaussian_mask_dilation_px,
-                "delta_hidden_dim": delta_hidden_dim,
-                "delta_geometry_scale": delta_geometry_scale,
-                "delta_texture_scale": delta_texture_scale,
-                "enable_invisible_gaussian_bank": enable_invisible_gaussian_bank,
-                "invisible_gaussian_bank_size": invisible_gaussian_bank_size,
                 "train_prediction_head": train_prediction_head,
             },
         )
@@ -271,17 +254,6 @@ def finetune_ddp_cli(
     dist.destroy_process_group()
 
 
-def _predictor_state_dict_for_save(predictor: torch.nn.Module) -> dict[str, torch.Tensor]:
-    state_dict = predictor.state_dict()
-    remapped = {}
-    for key, value in state_dict.items():
-        if key.startswith("delta_decoder.module."):
-            remapped[key.replace("delta_decoder.module.", "delta_decoder.")] = value
-        else:
-            remapped[key] = value
-    return remapped
-
-
 def save_ddp_checkpoint(
     path: Path,
     predictor: torch.nn.Module,
@@ -289,7 +261,10 @@ def save_ddp_checkpoint(
     step: int,
 ) -> None:
     payload = {
-        "predictor": _predictor_state_dict_for_save(predictor),
+        "predictor": {
+            (key[7:] if key.startswith("module.") else key): value
+            for key, value in predictor.state_dict().items()
+        },
         "optimizer": optimizer.state_dict(),
         "step": step,
     }

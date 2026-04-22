@@ -16,9 +16,8 @@ import torch
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
-from sharp.utils.gaussians import SceneMetaData, save_ply, unproject_gaussians
+from sharp.utils.gaussians import SceneMetaData, save_ply
 
-from .finetune import InvisibleGaussianBank, LightweightDeltaDecoder, concat_gaussians
 from .predict import DEFAULT_MODEL_URL, predict_image
 from .render import render_gaussians
 
@@ -54,18 +53,6 @@ LOGGER = logging.getLogger(__name__)
     help="Whether to require an exact state_dict key match when loading checkpoint.",
 )
 @click.option(
-    "--use-delta/--ignore-delta",
-    default=True,
-    show_default=True,
-    help="Whether to use delta_decoder weights from finetune checkpoints during inference.",
-)
-@click.option(
-    "--use-bank/--ignore-bank",
-    default=True,
-    show_default=True,
-    help="Whether to use invisible_gaussian_bank weights from finetune checkpoints during inference.",
-)
-@click.option(
     "--render/--no-render",
     "with_rendering",
     is_flag=True,
@@ -84,8 +71,6 @@ def predict_finetune_cli(
     output_path: Path,
     checkpoint_path: Path | None,
     strict: bool,
-    use_delta: bool,
-    use_bank: bool,
     with_rendering: bool,
     device: str,
     verbose: bool,
@@ -113,19 +98,9 @@ def predict_finetune_cli(
         LOGGER.warning("Can only run rendering with gsplat on CUDA. Rendering is disabled.")
         with_rendering = False
 
-    state_dict, has_delta_decoder, has_invisible_bank = load_predictor_state_dict(checkpoint_path)
+    state_dict = load_predictor_state_dict(checkpoint_path)
 
     gaussian_predictor = create_predictor(PredictorParams())
-    if has_delta_decoder and use_delta:
-        add_delta_decoder_from_checkpoint(gaussian_predictor, state_dict)
-    elif has_delta_decoder and not use_delta:
-        state_dict = strip_delta_decoder_keys(state_dict)
-    if has_invisible_bank and use_bank:
-        add_invisible_bank_from_checkpoint(gaussian_predictor, state_dict)
-        state_dict = upgrade_legacy_invisible_bank_state_dict(state_dict)
-    elif has_invisible_bank and not use_bank:
-        state_dict = strip_invisible_bank_keys(state_dict)
-
     incompatibility = gaussian_predictor.load_state_dict(state_dict, strict=strict)
     if incompatibility.missing_keys:
         LOGGER.warning("Missing keys when loading checkpoint: %d", len(incompatibility.missing_keys))
@@ -141,13 +116,7 @@ def predict_finetune_cli(
         LOGGER.info("Processing %s", image_path)
         image, _, f_px = io.load_rgb(image_path)
         height, width = image.shape[:2]
-        if has_delta_decoder and use_delta:
-            gaussians = predict_image_with_delta(gaussian_predictor, image, f_px, torch.device(device))
-        else:
-            gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
-        if has_invisible_bank and use_bank:
-            bank_gaussians = gaussian_predictor.invisible_gaussian_bank(batch_size=1)
-            gaussians = concat_gaussians(gaussians, bank_gaussians)
+        gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
         save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
 
         if with_rendering:
@@ -155,11 +124,11 @@ def predict_finetune_cli(
             render_gaussians(gaussians, metadata, (output_path / image_path.stem).with_suffix(".mp4"))
 
 
-def load_predictor_state_dict(checkpoint_path: Path | None) -> tuple[dict[str, Any], bool, bool]:
+def load_predictor_state_dict(checkpoint_path: Path | None) -> dict[str, Any]:
     """Load predictor state dict from raw or wrapped checkpoint format."""
     if checkpoint_path is None:
         LOGGER.info("No checkpoint provided. Downloading default model from %s", DEFAULT_MODEL_URL)
-        return torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True), False, False
+        return torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
 
     LOGGER.info("Loading checkpoint from %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -174,11 +143,7 @@ def load_predictor_state_dict(checkpoint_path: Path | None) -> tuple[dict[str, A
         raise TypeError(f"Unsupported checkpoint payload type: {type(state_dict)!r}")
 
     normalized_state_dict = normalize_state_dict_keys(state_dict)
-    has_delta_decoder = any(key.startswith("delta_decoder.") for key in normalized_state_dict)
-    has_invisible_bank = any(
-        key.startswith("invisible_gaussian_bank.") for key in normalized_state_dict
-    )
-    return normalized_state_dict, has_delta_decoder, has_invisible_bank
+    return strip_delta_decoder_keys(normalized_state_dict)
 
 
 def normalize_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -203,120 +168,3 @@ def strip_delta_decoder_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
             dropped_keys[0],
         )
     return cleaned
-
-
-def strip_invisible_bank_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
-    """Drop invisible_gaussian_bank keys for compatibility/baseline inference."""
-    cleaned: dict[str, Any] = {}
-    dropped_keys: list[str] = []
-    for key, value in state_dict.items():
-        if key.startswith("invisible_gaussian_bank."):
-            dropped_keys.append(key)
-            continue
-        cleaned[key] = value
-    if dropped_keys:
-        LOGGER.info(
-            "Ignoring %d invisible bank keys (e.g. %s) before loading predictor weights.",
-            len(dropped_keys),
-            dropped_keys[0],
-        )
-    return cleaned
-
-
-def add_delta_decoder_from_checkpoint(predictor, state_dict: dict[str, Any]) -> None:
-    """Attach a delta decoder module so finetune checkpoints can be used during inference."""
-    first_weight = state_dict.get("delta_decoder.net.0.weight")
-    if first_weight is None:
-        raise KeyError("Checkpoint indicates delta_decoder keys but delta_decoder.net.0.weight is missing.")
-    hidden_dim = int(first_weight.shape[0])
-    feature_dim = predictor.prediction_head.geometry_prediction_head.in_channels
-    num_layers = predictor.prediction_head.num_layers
-    predictor.delta_decoder = LightweightDeltaDecoder(
-        feature_dim=feature_dim,
-        num_layers=num_layers,
-        hidden_dim=hidden_dim,
-        geometry_scale=0.05,
-        texture_scale=1.0,
-    )
-    LOGGER.info("Attached delta_decoder for inference (hidden_dim=%d).", hidden_dim)
-
-
-def add_invisible_bank_from_checkpoint(predictor, state_dict: dict[str, Any]) -> None:
-    """Attach an invisible Gaussian bank module if checkpoint contains it."""
-    means = state_dict.get("invisible_gaussian_bank.mean_vectors")
-    if means is None:
-        raise KeyError(
-            "Checkpoint indicates invisible_gaussian_bank keys but mean_vectors are missing."
-        )
-    bank_size = int(means.shape[0])
-    predictor.invisible_gaussian_bank = InvisibleGaussianBank(bank_size)
-    LOGGER.info("Attached invisible_gaussian_bank for inference (size=%d).", bank_size)
-
-
-def upgrade_legacy_invisible_bank_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
-    """Upgrade old invisible bank checkpoints (absolute params) to base+residual format."""
-    mean_key = "invisible_gaussian_bank.mean_vectors"
-    if mean_key not in state_dict:
-        return state_dict
-    base_mean_key = "invisible_gaussian_bank.base_mean_vectors"
-    if base_mean_key in state_dict:
-        return state_dict
-
-    LOGGER.info("Upgrading legacy invisible_gaussian_bank checkpoint to base+residual format.")
-    upgraded = dict(state_dict)
-    mapping = {
-        "mean_vectors": "base_mean_vectors",
-        "log_scales": "base_log_scales",
-        "raw_quaternions": "base_raw_quaternions",
-        "color_logits": "base_color_logits",
-        "opacity_logits": "base_opacity_logits",
-    }
-    for param_name, base_name in mapping.items():
-        param_key = f"invisible_gaussian_bank.{param_name}"
-        base_key = f"invisible_gaussian_bank.{base_name}"
-        param_value = upgraded.get(param_key)
-        if param_value is None:
-            continue
-        upgraded[base_key] = param_value.clone()
-        upgraded[param_key] = torch.zeros_like(param_value)
-    return upgraded
-
-
-def predict_image_with_delta(predictor, image, f_px: float, device: torch.device):
-    """Predict gaussians and apply finetuned delta decoder."""
-    image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
-    _, height, width = image_pt.shape
-    disparity_factor = torch.tensor([f_px / width], dtype=torch.float32, device=device)
-    internal_shape = (1536, 1536)
-    image_resized_pt = torch.nn.functional.interpolate(
-        image_pt[None],
-        size=(internal_shape[1], internal_shape[0]),
-        mode="bilinear",
-        align_corners=True,
-    )
-
-    monodepth_output = predictor.monodepth_model(image_resized_pt)
-    monodepth_disparity = monodepth_output.disparity
-    monodepth = disparity_factor[:, None, None, None] / monodepth_disparity.clamp(min=1e-4, max=1e4)
-    monodepth, _ = predictor.depth_alignment(monodepth, None, monodepth_output.decoder_features)
-    init_output = predictor.init_model(image_resized_pt, monodepth)
-    image_features = predictor.feature_model(
-        init_output.feature_input, encodings=monodepth_output.output_features
-    )
-    delta_values = predictor.prediction_head(image_features)
-    delta_values = delta_values + predictor.delta_decoder(image_features)
-    gaussians_ndc = predictor.gaussian_composer(
-        delta=delta_values,
-        base_values=init_output.gaussian_base_values,
-        global_scale=init_output.global_scale,
-    )
-
-    intrinsics = torch.tensor(
-        [[f_px, 0, width / 2, 0], [0, f_px, height / 2, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-        dtype=torch.float32,
-        device=device,
-    )
-    intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= internal_shape[0] / width
-    intrinsics_resized[1] *= internal_shape[1] / height
-    return unproject_gaussians(gaussians_ndc, torch.eye(4, device=device), intrinsics_resized, internal_shape)
