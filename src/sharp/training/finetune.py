@@ -268,9 +268,26 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             )
             mask = F.interpolate(mask_grid, size=(h, w), mode="nearest")
 
-            src_render_for_refiner = render_src.color.detach()
-            tgt_render_for_refiner = render_tgt.color.detach()
-            delta_map = occlusion_refiner(src_render_for_refiner, tgt_render_for_refiner, mask)
+            # Gaussian deltas live on predictor output grid (output_res x output_res),
+            # so we run the occlusion refiner on that grid as well.
+            src_render_for_refiner = F.interpolate(
+                render_src.color.detach(),
+                size=(output_res, output_res),
+                mode="bilinear",
+                align_corners=False,
+            )
+            tgt_render_for_refiner = F.interpolate(
+                render_tgt.color.detach(),
+                size=(output_res, output_res),
+                mode="bilinear",
+                align_corners=False,
+            )
+            mask_for_refiner = F.interpolate(mask, size=(output_res, output_res), mode="nearest")
+            delta_map = occlusion_refiner(
+                src_render_for_refiner,
+                tgt_render_for_refiner,
+                mask_for_refiner,
+            )
 
             delta_mask = invisible_tgt.float().view(b, num_layers, output_res, output_res)[:, None]
             masked_delta = delta_map * delta_mask
