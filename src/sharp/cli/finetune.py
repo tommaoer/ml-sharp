@@ -226,18 +226,20 @@ def finetune_cli(
         param.numel() for _, param in predictor.named_parameters() if param.requires_grad
     )
     if trainable_parameter_count == 0:
-        raise click.UsageError(
-            "No trainable parameters selected. Use --train-prediction-head to enable fine-tuning."
+        LOGGER.warning(
+            "No trainable parameters selected. Running forward-only mode (no optimizer updates)."
         )
-    LOGGER.info(
-        "Optimizing modules: %s (%d parameters)",
-        ", ".join(trainable_module_names),
-        trainable_parameter_count,
-    )
-    trainable_parameters = [
-        param for _, param in predictor.named_parameters() if param.requires_grad
-    ]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
+        optimizer: torch.optim.Optimizer | None = None
+    else:
+        LOGGER.info(
+            "Optimizing modules: %s (%d parameters)",
+            ", ".join(trainable_module_names),
+            trainable_parameter_count,
+        )
+        trainable_parameters = [
+            param for _, param in predictor.named_parameters() if param.requires_grad
+        ]
+        optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
 
     write_config(
         output_dir / "finetune_config.json",
@@ -280,7 +282,8 @@ def finetune_cli(
         for batch in loader:
             batch = move_batch_to_device(batch, device_t)
 
-            optimizer.zero_grad(set_to_none=True)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
             outputs = forward_training_pass(
                 predictor,
                 renderer,
@@ -305,8 +308,9 @@ def finetune_cli(
                 LOGGER.info("Saving visualization at epoch=0 step=0 before optimization")
                 save_visualization_batch(visualization_dir, global_step, batch, outputs)
 
-            losses.total.backward()
-            optimizer.step()
+            if optimizer is not None:
+                losses.total.backward()
+                optimizer.step()
 
             global_step += 1
             if global_step % log_every == 0:
