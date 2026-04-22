@@ -31,6 +31,18 @@ def configure(log_level: int, log_path: Path | None = None, prefix: str | None =
     # Set level.
     logger.setLevel(log_level)
 
+    # Keep third-party libraries from flooding the console when verbose mode is enabled.
+    # We still keep SHARP debug logs via the root/prefix logger above.
+    noisy_loggers = [
+        "PIL",
+        "PIL.Image",
+        "matplotlib",
+        "urllib3",
+        "imageio",
+    ]
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.INFO)
+
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
     # Set up console handler.
