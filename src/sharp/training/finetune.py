@@ -52,6 +52,7 @@ class OcclusionGaussianRefiner(nn.Module):
     def __init__(self, width: int = 32, steps: int = 4, num_layers: int = 2):
         """Initialize an occlusion refiner network."""
         super().__init__()
+        self.steps = steps
         widths = [width << i for i in range(steps + 1)]
         self.encoder = UNetEncoder(dim_in=7, width=widths, steps=steps, norm_num_groups=4)
         self.decoder = UNetDecoder(dim_out=widths[0], width=widths, steps=steps, norm_num_groups=4)
@@ -66,8 +67,21 @@ class OcclusionGaussianRefiner(nn.Module):
     ) -> torch.Tensor:
         """Predict per-Gaussian attribute deltas for the occlusion copy."""
         x = torch.cat([src_render, tgt_render, mask], dim=1)
+        # UNetEncoder uses stride-2 pooling at each level. For odd resolutions
+        # (e.g. 1080p), skip-connections may mismatch by 1 pixel after repeated
+        # down/up-sampling. We pad to a multiple of 2**steps and crop back.
+        stride = 1 << self.steps
+        h, w = x.shape[-2:]
+        pad_h = (stride - (h % stride)) % stride
+        pad_w = (stride - (w % stride)) % stride
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
         features = self.encoder(x)
         out = self.head(self.decoder(features))
+        if pad_h > 0 or pad_w > 0:
+            out = out[..., :h, :w]
+
         b, _, h, w = out.shape
         return out.view(b, 14, self.num_layers, h, w)
 
