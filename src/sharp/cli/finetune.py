@@ -31,6 +31,11 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 @click.option("--device", type=str, default="cuda")
 @click.option("--min-view-distance", type=float, default=0.05)
 @click.option("--max-view-distance", type=float, default=2.0)
+@click.option(
+    "--disable-updates/--enable-updates",
+    default=False,
+    help="Disable all parameter updates and keep output identical to base SHARP prediction.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def finetune_cli(
     dataset_root: Path,
@@ -46,6 +51,7 @@ def finetune_cli(
     device: str,
     min_view_distance: float,
     max_view_distance: float,
+    disable_updates: bool,
     verbose: bool,
 ):
     """Fine-tune SHARP with source/target frame supervision from videos."""
@@ -85,5 +91,6 @@ def finetune_cli(
         device=device,
         min_view_distance=min_view_distance,
         max_view_distance=max_view_distance,
+        disable_updates=disable_updates,
     )
     run_finetuning(cfg, predictor)

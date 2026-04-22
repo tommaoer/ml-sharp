@@ -44,6 +44,7 @@ class FineTuneConfig:
     device: str = "cuda"
     min_view_distance: float = 0.05
     max_view_distance: float = 2.0
+    disable_updates: bool = False
 
 
 class OcclusionGaussianRefiner(nn.Module):
@@ -180,17 +181,25 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
     predictor = predictor.to(device)
     predictor.train()
 
-    if not config.train_gaussian_decoder:
+    if not config.train_gaussian_decoder or config.disable_updates:
         for p in predictor.parameters():
             p.requires_grad_(False)
 
     occlusion_refiner = OcclusionGaussianRefiner(num_layers=num_layers).to(device)
     renderer = GSplatRenderer(color_space="linearRGB", background_color="black").to(device)
 
-    trainable = [p for p in predictor.parameters() if p.requires_grad]
-    trainable += list(occlusion_refiner.parameters())
-
-    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+    if config.disable_updates:
+        LOGGER.info(
+            "disable_updates=True: running forward/render only, "
+            "without any parameter updates."
+        )
+        occlusion_refiner.requires_grad_(False)
+        trainable: list[torch.Tensor] = []
+        optimizer = None
+    else:
+        trainable = [p for p in predictor.parameters() if p.requires_grad]
+        trainable += list(occlusion_refiner.parameters())
+        optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
     loss_weights = FineTuneLossWeights()
     perceptual = VGGPerceptualLoss().to(device)
@@ -226,14 +235,25 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 mode="bilinear",
                 align_corners=True,
             )
+            tgt_resized = F.interpolate(
+                tgt_image,
+                size=internal_size[::-1],
+                mode="bilinear",
+                align_corners=True,
+            )
             disparity_factor = (src_intr[:, 0, 0] / float(w)).float()
-
-            gaussians_ndc = predictor(src_resized, disparity_factor)
 
             intr_src_internal = torch.stack(
                 [_make_intrinsics_resized(src_intr[i], (w, h), internal_size) for i in range(b)],
                 dim=0,
             )
+            intr_tgt_internal = torch.stack(
+                [_make_intrinsics_resized(tgt_intr[i], (w, h), internal_size) for i in range(b)],
+                dim=0,
+            )
+
+            gaussians_ndc = predictor(src_resized, disparity_factor)
+
             gaussians_world = unproject_gaussians(
                 gaussians_ndc,
                 src_w2c,
@@ -244,20 +264,32 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             render_src = renderer(
                 gaussians_world,
                 src_w2c,
-                src_intr,
-                image_width=w,
-                image_height=h,
+                intr_src_internal,
+                image_width=internal_size[0],
+                image_height=internal_size[1],
             )
             render_tgt = renderer(
                 gaussians_world,
                 tgt_w2c,
-                tgt_intr,
-                image_width=w,
-                image_height=h,
+                intr_tgt_internal,
+                image_width=internal_size[0],
+                image_height=internal_size[1],
             )
 
-            vis_src = _compute_gaussian_visibility(gaussians_world, src_w2c, src_intr, w, h)
-            vis_tgt = _compute_gaussian_visibility(gaussians_world, tgt_w2c, tgt_intr, w, h)
+            vis_src = _compute_gaussian_visibility(
+                gaussians_world,
+                src_w2c,
+                intr_src_internal,
+                internal_size[0],
+                internal_size[1],
+            )
+            vis_tgt = _compute_gaussian_visibility(
+                gaussians_world,
+                tgt_w2c,
+                intr_tgt_internal,
+                internal_size[0],
+                internal_size[1],
+            )
             invisible_tgt = vis_tgt & (~vis_src)
 
             mask_grid = (
@@ -266,7 +298,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 .max(dim=1)
                 .values[:, None]
             )
-            mask = F.interpolate(mask_grid, size=(h, w), mode="nearest")
+            mask = F.interpolate(mask_grid, size=internal_size[::-1], mode="nearest")
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
@@ -289,37 +321,44 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 mask_for_refiner,
             )
 
-            delta_mask = invisible_tgt.float().view(b, num_layers, output_res, output_res)[:, None]
-            masked_delta = delta_map * delta_mask
-            occluded_copy = _apply_gaussian_delta(gaussians_world, masked_delta)
-            occluded_copy = Gaussians3D(
-                mean_vectors=occluded_copy.mean_vectors,
-                singular_values=occluded_copy.singular_values,
-                quaternions=occluded_copy.quaternions,
-                colors=occluded_copy.colors,
-                opacities=occluded_copy.opacities * invisible_tgt.float(),
-            )
-            gaussians_aug = _concat_gaussians(gaussians_world, occluded_copy)
+            if config.disable_updates:
+                delta_mask = torch.zeros_like(delta_map[:, :1])
+                masked_delta = torch.zeros_like(delta_map)
+                gaussians_aug = gaussians_world
+            else:
+                delta_mask = (
+                    invisible_tgt.float().view(b, num_layers, output_res, output_res)[:, None]
+                )
+                masked_delta = delta_map * delta_mask
+                occluded_copy = _apply_gaussian_delta(gaussians_world, masked_delta)
+                occluded_copy = Gaussians3D(
+                    mean_vectors=occluded_copy.mean_vectors,
+                    singular_values=occluded_copy.singular_values,
+                    quaternions=occluded_copy.quaternions,
+                    colors=occluded_copy.colors,
+                    opacities=occluded_copy.opacities * invisible_tgt.float(),
+                )
+                gaussians_aug = _concat_gaussians(gaussians_world, occluded_copy)
             render_tgt_aug = renderer(
                 gaussians_aug,
                 tgt_w2c,
-                tgt_intr,
-                image_width=w,
-                image_height=h,
+                intr_tgt_internal,
+                image_width=internal_size[0],
+                image_height=internal_size[1],
             )
 
-            loss_color = F.l1_loss(render_src.color, src_image) + F.l1_loss(
+            loss_color = F.l1_loss(render_src.color, src_resized) + F.l1_loss(
                 render_tgt_aug.color,
-                tgt_image,
+                tgt_resized,
             )
-            loss_percep = perceptual(render_tgt_aug.color, tgt_image)
+            loss_percep = perceptual(render_tgt_aug.color, tgt_resized)
             loss_alpha = F.binary_cross_entropy(
                 render_src.alpha.clamp(1e-5, 1 - 1e-5),
                 torch.ones_like(render_src.alpha),
             )
             loss_tv = total_variation_loss(render_tgt_aug.depth)
             loss_occ_color = (
-                (torch.abs(render_tgt_aug.color - tgt_image) * mask).sum()
+                (torch.abs(render_tgt_aug.color - tgt_resized) * mask).sum()
                 / mask.sum().clamp_min(1.0)
             )
             loss_occ_delta = masked_delta.abs().mean()
@@ -344,17 +383,18 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                     config.output_dir,
                     epoch,
                     global_step,
-                    src_image,
+                    src_resized,
                     render_src.color,
-                    tgt_image,
+                    tgt_resized,
                     render_tgt_aug.color,
                     mask,
                     render_tgt_aug.color * mask,
                 )
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
             if global_step % 10 == 0:
                 LOGGER.info(
