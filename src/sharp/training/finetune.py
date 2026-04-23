@@ -111,6 +111,8 @@ def _compute_gaussian_visibility(
     intrinsics: torch.Tensor,
     width: int,
     height: int,
+    rendered_depth: torch.Tensor | None = None,
+    depth_eps: float = 0.05,
 ) -> torch.Tensor:
     means = gaussians.mean_vectors
     b, n, _ = means.shape
@@ -122,7 +124,24 @@ def _compute_gaussian_visibility(
     uv_h = cam @ intrinsics.transpose(-1, -2)
     u = uv_h[..., 0] / z
     v = uv_h[..., 1] / z
-    return (z > 1e-3) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    in_frustum = (z > 1e-3) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    if rendered_depth is None:
+        return in_frustum
+
+    # Depth-aware visibility: Gaussian must lie close to rendered surface depth.
+    width_denom = max(width - 1, 1)
+    height_denom = max(height - 1, 1)
+    grid_x = (u / width_denom * 2.0 - 1.0).clamp(-1.0, 1.0)
+    grid_y = (v / height_denom * 2.0 - 1.0).clamp(-1.0, 1.0)
+    sample_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2)  # [B, N, 1, 2]
+    sampled_depth = F.grid_sample(
+        rendered_depth,
+        sample_grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).squeeze(1).squeeze(-1)  # [B, N]
+    return in_frustum & (z <= sampled_depth + depth_eps)
 
 
 def _apply_gaussian_delta(
@@ -288,6 +307,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_src_render,
                 w,
                 h,
+                rendered_depth=render_src.depth,
             )
             vis_tgt = _compute_gaussian_visibility(
                 gaussians_world,
@@ -295,6 +315,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_tgt_render,
                 w,
                 h,
+                rendered_depth=render_tgt.depth,
             )
             invisible_tgt = vis_tgt & (~vis_src)
 
