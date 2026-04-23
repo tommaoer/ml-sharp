@@ -201,24 +201,30 @@ def _compute_pixel_disocclusion_mask(
 
 def _morphological_smooth_mask(
     mask: torch.Tensor,
-    kernel_size: int = 15,
-    min_pool_kernel: int = 31,
+    open_kernel: int = 5,
+    close_kernel: int = 17,
+    min_pool_kernel: int = 41,
 ) -> torch.Tensor:
-    """Apply simple morphology to keep large mask regions and remove speckles."""
-    if kernel_size > 1:
-        pad = kernel_size // 2
-        # Closing (dilate -> erode): fills small holes.
-        dilated = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=pad)
-        eroded = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=kernel_size, stride=1, padding=pad)
-    else:
-        eroded = mask
+    """Apply morphology to remove thin lines and preserve large white regions."""
+    out = mask
+
+    if open_kernel > 1:
+        pad = open_kernel // 2
+        # Opening (erode -> dilate): removes thin structures.
+        eroded = 1.0 - F.max_pool2d(1.0 - out, kernel_size=open_kernel, stride=1, padding=pad)
+        out = F.max_pool2d(eroded, kernel_size=open_kernel, stride=1, padding=pad)
+
+    if close_kernel > 1:
+        pad = close_kernel // 2
+        # Closing fills interior holes in large disocclusion regions.
+        dilated = F.max_pool2d(out, kernel_size=close_kernel, stride=1, padding=pad)
+        out = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=close_kernel, stride=1, padding=pad)
 
     if min_pool_kernel > 1:
         pad = min_pool_kernel // 2
-        # Large-window vote to keep only coherent, large connected-like regions.
-        area_ratio = F.avg_pool2d(eroded, kernel_size=min_pool_kernel, stride=1, padding=pad)
-        eroded = (area_ratio > 0.1).float() * eroded
-    return eroded
+        area_ratio = F.avg_pool2d(out, kernel_size=min_pool_kernel, stride=1, padding=pad)
+        out = (area_ratio > 0.2).float() * out
+    return out
 
 
 def _apply_gaussian_delta(
@@ -405,8 +411,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_src=intr_src_render,
                 intr_tgt=intr_tgt_render,
             )
-            # Expand mask pixels to cover larger coherent disocclusion/external regions.
-            mask = F.max_pool2d(mask, kernel_size=9, stride=1, padding=4)
+            mask = _morphological_smooth_mask(mask)
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
