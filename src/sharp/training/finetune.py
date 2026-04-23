@@ -199,6 +199,28 @@ def _compute_pixel_disocclusion_mask(
     return (tgt_visible & (~reproj_visible)).float()
 
 
+def _morphological_smooth_mask(
+    mask: torch.Tensor,
+    kernel_size: int = 15,
+    min_pool_kernel: int = 31,
+) -> torch.Tensor:
+    """Apply simple morphology to keep large mask regions and remove speckles."""
+    if kernel_size > 1:
+        pad = kernel_size // 2
+        # Closing (dilate -> erode): fills small holes.
+        dilated = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=pad)
+        eroded = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=kernel_size, stride=1, padding=pad)
+    else:
+        eroded = mask
+
+    if min_pool_kernel > 1:
+        pad = min_pool_kernel // 2
+        # Large-window vote to keep only coherent, large connected-like regions.
+        area_ratio = F.avg_pool2d(eroded, kernel_size=min_pool_kernel, stride=1, padding=pad)
+        eroded = (area_ratio > 0.1).float() * eroded
+    return eroded
+
+
 def _apply_gaussian_delta(
     base: Gaussians3D,
     delta: torch.Tensor,
@@ -383,6 +405,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_src=intr_src_render,
                 intr_tgt=intr_tgt_render,
             )
+            mask = _morphological_smooth_mask(mask)
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
