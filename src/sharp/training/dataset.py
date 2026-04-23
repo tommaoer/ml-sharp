@@ -43,15 +43,23 @@ class VideoCameraFineTuneDataset(Dataset):
     def __init__(
         self,
         dataset_root: Path,
-        min_view_distance: float = 0.05,
-        max_view_distance: float = 2.0,
+        min_frame_gap: int = 1,
+        max_frame_gap: int = 30,
         max_samples: int = 100000,
     ) -> None:
         """Initialize dataset and discover valid sequence folders."""
         self.dataset_root = dataset_root
-        self.min_view_distance = min_view_distance
-        self.max_view_distance = max_view_distance
+        self.min_frame_gap = min_frame_gap
+        self.max_frame_gap = max_frame_gap
         self.max_samples = max_samples
+
+        if self.min_frame_gap < 1:
+            raise ValueError(f"min_frame_gap must be >= 1, got {self.min_frame_gap}")
+        if self.max_frame_gap < self.min_frame_gap:
+            raise ValueError(
+                "max_frame_gap must be >= min_frame_gap, "
+                f"got {self.max_frame_gap} < {self.min_frame_gap}"
+            )
 
         self.records = self._discover_records(dataset_root)
         if len(self.records) == 0:
@@ -101,14 +109,15 @@ class VideoCameraFineTuneDataset(Dataset):
         num_frames = c2ws.shape[0]
         for _ in range(64):
             src = random.randrange(num_frames)
-            tgt = random.randrange(num_frames)
-            if src == tgt:
+            valid_tgts = [
+                idx
+                for idx in range(num_frames)
+                if self.min_frame_gap <= abs(idx - src) <= self.max_frame_gap
+            ]
+            if len(valid_tgts) == 0:
                 continue
-            src_t = c2ws[src, :3, 3]
-            tgt_t = c2ws[tgt, :3, 3]
-            distance = torch.linalg.norm(src_t - tgt_t).item()
-            if self.min_view_distance <= distance <= self.max_view_distance:
-                return src, tgt
+            tgt = random.choice(valid_tgts)
+            return src, tgt
         src = random.randrange(num_frames)
         tgt = (src + random.randrange(1, num_frames)) % num_frames
         return src, tgt

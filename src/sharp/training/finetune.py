@@ -42,8 +42,8 @@ class FineTuneConfig:
     train_gaussian_decoder: bool = True
     enable_depth_loss: bool = False
     device: str = "cuda"
-    min_view_distance: float = 0.05
-    max_view_distance: float = 2.0
+    min_frame_gap: int = 1
+    max_frame_gap: int = 30
     disable_updates: bool = False
 
 
@@ -319,8 +319,8 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
 
     dataset = VideoCameraFineTuneDataset(
         dataset_root=config.dataset_root,
-        min_view_distance=config.min_view_distance,
-        max_view_distance=config.max_view_distance,
+        min_frame_gap=config.min_frame_gap,
+        max_frame_gap=config.max_frame_gap,
         max_samples=config.epochs * config.steps_per_epoch,
     )
     loader = DataLoader(dataset, batch_size=config.batch_size, num_workers=0)

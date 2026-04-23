@@ -29,8 +29,8 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 @click.option("--train-gaussian-decoder/--freeze-gaussian-decoder", default=True)
 @click.option("--enable-depth-loss/--disable-depth-loss", default=False)
 @click.option("--device", type=str, default="cuda")
-@click.option("--min-view-distance", type=float, default=0.05)
-@click.option("--max-view-distance", type=float, default=2.0)
+@click.option("--min-frame-gap", type=int, default=1)
+@click.option("--max-frame-gap", type=int, default=30)
 @click.option(
     "--disable-updates/--enable-updates",
     default=False,
@@ -49,8 +49,8 @@ def finetune_cli(
     train_gaussian_decoder: bool,
     enable_depth_loss: bool,
     device: str,
-    min_view_distance: float,
-    max_view_distance: float,
+    min_frame_gap: int,
+    max_frame_gap: int,
     disable_updates: bool,
     verbose: bool,
 ):
@@ -89,8 +89,8 @@ def finetune_cli(
         train_gaussian_decoder=train_gaussian_decoder,
         enable_depth_loss=enable_depth_loss,
         device=device,
-        min_view_distance=min_view_distance,
-        max_view_distance=max_view_distance,
+        min_frame_gap=min_frame_gap,
+        max_frame_gap=max_frame_gap,
         disable_updates=disable_updates,
     )
     run_finetuning(cfg, predictor)
