@@ -200,7 +200,9 @@ def _compute_pixel_disocclusion_mask(
     ones = torch.ones_like(z)
     pts_src = torch.stack([x, y, z, ones], dim=-1)  # [B, H, W, 4]
 
-    pts_tgt = pts_src @ rel_tgt_w2c.transpose(-1, -2)
+    # Batched row-vector transform: [B, H, W, 4] x [B, 4, 4] -> [B, H, W, 4].
+    # Using einsum avoids matmul broadcast mismatches on H/W dimensions.
+    pts_tgt = torch.einsum("bhwc,bjc->bhwj", pts_src, rel_tgt_w2c)
     z_tgt = pts_tgt[..., 2].clamp_min(1e-6)
 
     fx_t = intr_tgt[:, 0, 0][:, None, None]
