@@ -251,26 +251,31 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 [_make_intrinsics_resized(tgt_intr[i], (w, h), internal_size) for i in range(b)],
                 dim=0,
             )
+            identity_w2c = torch.eye(4, device=device, dtype=src_w2c.dtype)[None].repeat(b, 1, 1)
+            # SHARP predicts Gaussians in the source camera frame. Since the source
+            # extrinsics are implicit in SHARP (identity), we convert target camera
+            # pose to a relative transform from source->target.
+            rel_tgt_w2c = tgt_w2c @ torch.linalg.inv(src_w2c)
 
             gaussians_ndc = predictor(src_resized, disparity_factor)
 
             gaussians_world = unproject_gaussians(
                 gaussians_ndc,
-                src_w2c,
+                identity_w2c,
                 intr_src_internal,
                 internal_size,
             )
 
             render_src = renderer(
                 gaussians_world,
-                src_w2c,
+                identity_w2c,
                 intr_src_internal,
                 image_width=internal_size[0],
                 image_height=internal_size[1],
             )
             render_tgt = renderer(
                 gaussians_world,
-                tgt_w2c,
+                rel_tgt_w2c,
                 intr_tgt_internal,
                 image_width=internal_size[0],
                 image_height=internal_size[1],
@@ -278,14 +283,14 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
 
             vis_src = _compute_gaussian_visibility(
                 gaussians_world,
-                src_w2c,
+                identity_w2c,
                 intr_src_internal,
                 internal_size[0],
                 internal_size[1],
             )
             vis_tgt = _compute_gaussian_visibility(
                 gaussians_world,
-                tgt_w2c,
+                rel_tgt_w2c,
                 intr_tgt_internal,
                 internal_size[0],
                 internal_size[1],
@@ -341,7 +346,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 gaussians_aug = _concat_gaussians(gaussians_world, occluded_copy)
             render_tgt_aug = renderer(
                 gaussians_aug,
-                tgt_w2c,
+                rel_tgt_w2c,
                 intr_tgt_internal,
                 image_width=internal_size[0],
                 image_height=internal_size[1],
