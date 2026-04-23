@@ -41,6 +41,7 @@ class FineTuneConfig:
     lr: float = 1e-5
     vis_interval: int = 100
     train_gaussian_decoder: bool = True
+    train_gaussian_delta_adaptor: bool = True
     enable_depth_loss: bool = False
     device: str = "cuda"
     min_frame_gap: int = 1
@@ -330,6 +331,14 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
         )
         gaussian_delta_adaptor.requires_grad_(False)
         trainable: list[torch.Tensor] = []
+        optimizer = None
+    elif not config.train_gaussian_delta_adaptor:
+        LOGGER.info(
+            "train_gaussian_delta_adaptor=False: keeping added adaptor frozen; "
+            "no adaptor parameter updates will run."
+        )
+        gaussian_delta_adaptor.requires_grad_(False)
+        trainable = []
         optimizer = None
     else:
         trainable = list(gaussian_delta_adaptor.parameters())

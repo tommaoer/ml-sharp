@@ -27,6 +27,11 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 @click.option("--lr", type=float, default=1e-5)
 @click.option("--vis-interval", type=int, default=100)
 @click.option("--train-gaussian-decoder/--freeze-gaussian-decoder", default=True)
+@click.option(
+    "--train-gaussian-delta-adaptor/--freeze-gaussian-delta-adaptor",
+    default=True,
+    help="Enable/disable training for the added Gaussian delta adaptor branch.",
+)
 @click.option("--enable-depth-loss/--disable-depth-loss", default=False)
 @click.option("--device", type=str, default="cuda")
 @click.option("--min-frame-gap", type=int, default=1)
@@ -47,6 +52,7 @@ def finetune_cli(
     lr: float,
     vis_interval: int,
     train_gaussian_decoder: bool,
+    train_gaussian_delta_adaptor: bool,
     enable_depth_loss: bool,
     device: str,
     min_frame_gap: int,
@@ -87,6 +93,7 @@ def finetune_cli(
         lr=lr,
         vis_interval=vis_interval,
         train_gaussian_decoder=train_gaussian_decoder,
+        train_gaussian_delta_adaptor=train_gaussian_delta_adaptor,
         enable_depth_loss=enable_depth_loss,
         device=device,
         min_frame_gap=min_frame_gap,
