@@ -6,6 +6,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,25 @@ class OcclusionGaussianRefiner(nn.Module):
 
         b, _, h, w = out.shape
         return out.view(b, 14, self.num_layers, h, w)
+
+
+class GaussianDeltaAdaptor(nn.Module):
+    """Gaussian-decoder-style delta predictor initialized from SHARP pretrained modules."""
+
+    def __init__(self, feature_model: nn.Module, prediction_head: nn.Module) -> None:
+        """Initialize by cloning SHARP pretrained decoder/head weights."""
+        super().__init__()
+        self.feature_model = copy.deepcopy(feature_model)
+        self.prediction_head = copy.deepcopy(prediction_head)
+
+    def forward(
+        self,
+        feature_input: torch.Tensor,
+        encodings: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Predict Gaussian attribute deltas from SHARP decoder-style features."""
+        features = self.feature_model(feature_input, encodings=encodings)
+        return self.prediction_head(features)
 
 
 def _to_image_u8(x: torch.Tensor) -> np.ndarray:
@@ -298,7 +318,10 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
         for p in predictor.parameters():
             p.requires_grad_(False)
 
-    occlusion_refiner = OcclusionGaussianRefiner(num_layers=num_layers).to(device)
+    gaussian_delta_adaptor = GaussianDeltaAdaptor(
+        predictor.feature_model,
+        predictor.prediction_head,
+    ).to(device)
     renderer = GSplatRenderer(color_space="linearRGB", background_color="black").to(device)
 
     if config.disable_updates:
@@ -306,12 +329,12 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             "disable_updates=True: running forward/render only, "
             "without any parameter updates."
         )
-        occlusion_refiner.requires_grad_(False)
+        gaussian_delta_adaptor.requires_grad_(False)
         trainable: list[torch.Tensor] = []
         optimizer = None
     else:
         trainable = [p for p in predictor.parameters() if p.requires_grad]
-        trainable += list(occlusion_refiner.parameters())
+        trainable += list(gaussian_delta_adaptor.parameters())
         optimizer = torch.optim.AdamW(trainable, lr=config.lr)
 
     loss_weights = FineTuneLossWeights()
@@ -362,7 +385,31 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             # pose to a relative transform from source->target.
             rel_tgt_w2c = tgt_w2c @ torch.linalg.inv(src_w2c)
 
-            gaussians_ndc = predictor(src_resized, disparity_factor)
+            # Run SHARP pipeline explicitly so we can add a decoder-like delta branch
+            # initialized from the pretrained Gaussian decoder/head.
+            monodepth_output = predictor.monodepth_model(src_resized)
+            monodepth_disparity = monodepth_output.disparity
+            monodepth = (
+                disparity_factor[:, None, None, None]
+                / monodepth_disparity.clamp(min=1e-4, max=1e4)
+            )
+            monodepth, _ = predictor.depth_alignment(
+                monodepth,
+                None,
+                monodepth_output.decoder_features,
+            )
+
+            init_output = predictor.init_model(src_resized, monodepth)
+            gaussian_features = predictor.feature_model(
+                init_output.feature_input,
+                encodings=monodepth_output.output_features,
+            )
+            delta_base = predictor.prediction_head(gaussian_features)
+            gaussians_ndc = predictor.gaussian_composer(
+                delta=delta_base,
+                base_values=init_output.gaussian_base_values,
+                global_scale=init_output.global_scale,
+            )
 
             gaussians_world = unproject_gaussians(
                 gaussians_ndc,
@@ -386,24 +433,6 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 image_height=h,
             )
 
-            vis_src = _compute_gaussian_visibility(
-                gaussians_world,
-                identity_w2c,
-                intr_src_render,
-                w,
-                h,
-                rendered_depth=render_src.depth,
-            )
-            vis_tgt = _compute_gaussian_visibility(
-                gaussians_world,
-                rel_tgt_w2c,
-                intr_tgt_render,
-                w,
-                h,
-                rendered_depth=render_tgt.depth,
-            )
-            invisible_tgt = vis_tgt & (~vis_src)
-
             # Pixel-based disocclusion mask (no Gaussian-level mask rendering).
             mask = _compute_pixel_disocclusion_mask(
                 src_depth=render_src.depth,
@@ -414,46 +443,45 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_tgt=intr_tgt_render,
             )
             mask = _morphological_smooth_mask(mask)
+            # Keep only central valid region (remove image borders), then intersect.
+            center_mask = torch.zeros_like(mask)
+            margin_h = int(0.08 * h)
+            margin_w = int(0.08 * w)
+            center_mask[:, :, margin_h : h - margin_h, margin_w : w - margin_w] = 1.0
+            mask = mask * center_mask
 
-            # Gaussian deltas live on predictor output grid (output_res x output_res),
-            # so we run the occlusion refiner on that grid as well.
-            src_render_for_refiner = F.interpolate(
-                render_src.color.detach(),
-                size=(output_res, output_res),
-                mode="bilinear",
-                align_corners=False,
-            )
-            tgt_render_for_refiner = F.interpolate(
-                render_tgt.color.detach(),
-                size=(output_res, output_res),
-                mode="bilinear",
-                align_corners=False,
-            )
+            # Decoder-style delta branch initialized from SHARP pretrained Gaussian decoder.
             mask_for_refiner = F.interpolate(mask, size=(output_res, output_res), mode="nearest")
-            delta_map = occlusion_refiner(
-                src_render_for_refiner,
-                tgt_render_for_refiner,
-                mask_for_refiner,
+            delta_map = gaussian_delta_adaptor(
+                init_output.feature_input,
+                monodepth_output.output_features,
             )
 
             if config.disable_updates:
-                delta_mask = torch.zeros_like(delta_map[:, :1])
+                delta_mask = torch.zeros_like(delta_map[:, :1, ...])
                 masked_delta = torch.zeros_like(delta_map)
                 gaussians_aug = gaussians_world
             else:
-                delta_mask = (
-                    invisible_tgt.float().view(b, num_layers, output_res, output_res)[:, None]
+                delta_mask = mask_for_refiner[:, :, None].repeat(
+                    1,
+                    1,
+                    num_layers,
+                    1,
+                    1,
                 )
                 masked_delta = delta_map * delta_mask
-                occluded_copy = _apply_gaussian_delta(gaussians_world, masked_delta)
-                occluded_copy = Gaussians3D(
-                    mean_vectors=occluded_copy.mean_vectors,
-                    singular_values=occluded_copy.singular_values,
-                    quaternions=occluded_copy.quaternions,
-                    colors=occluded_copy.colors,
-                    opacities=occluded_copy.opacities * invisible_tgt.float(),
+                delta_total = delta_base + masked_delta
+                gaussians_ndc_aug = predictor.gaussian_composer(
+                    delta=delta_total,
+                    base_values=init_output.gaussian_base_values,
+                    global_scale=init_output.global_scale,
                 )
-                gaussians_aug = _concat_gaussians(gaussians_world, occluded_copy)
+                gaussians_aug = unproject_gaussians(
+                    gaussians_ndc_aug,
+                    identity_w2c,
+                    intr_src_internal,
+                    internal_size,
+                )
             render_tgt_aug = renderer(
                 gaussians_aug,
                 rel_tgt_w2c,
@@ -528,7 +556,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
         torch.save(
             {
                 "predictor": predictor.state_dict(),
-                "occlusion_refiner": occlusion_refiner.state_dict(),
+                "gaussian_delta_adaptor": gaussian_delta_adaptor.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
             },
