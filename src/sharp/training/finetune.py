@@ -151,6 +151,17 @@ def _concat_gaussians(a: Gaussians3D, b: Gaussians3D) -> Gaussians3D:
     )
 
 
+def _mask_gaussians(gaussians: Gaussians3D, visible_mask: torch.Tensor) -> Gaussians3D:
+    """Mask Gaussians by visibility in source view."""
+    return Gaussians3D(
+        mean_vectors=gaussians.mean_vectors,
+        singular_values=gaussians.singular_values,
+        quaternions=gaussians.quaternions,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities * visible_mask.float(),
+    )
+
+
 def save_debug_visualization(
     output_dir: Path,
     epoch: int,
@@ -160,7 +171,6 @@ def save_debug_visualization(
     tgt_image: torch.Tensor,
     tgt_render: torch.Tensor,
     mask: torch.Tensor,
-    masked_tgt_render: torch.Tensor,
 ) -> None:
     """Save the requested training visualizations for one training step."""
     vis_dir = output_dir / "visualizations"
@@ -172,7 +182,6 @@ def save_debug_visualization(
     io.save_image(_to_image_u8(tgt_image[0]), vis_dir / f"{prefix}_tgt.png")
     io.save_image(_to_image_u8(tgt_render[0]), vis_dir / f"{prefix}_tgt_render.png")
     io.save_image(_to_image_u8(mask[0].repeat(3, 1, 1)), vis_dir / f"{prefix}_mask.png")
-    io.save_image(_to_image_u8(masked_tgt_render[0]), vis_dir / f"{prefix}_mask_render.png")
 
 
 def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int = 2) -> None:
@@ -234,20 +243,15 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 mode="bilinear",
                 align_corners=True,
             )
-            tgt_resized = F.interpolate(
-                tgt_image,
-                size=internal_size[::-1],
-                mode="bilinear",
-                align_corners=True,
-            )
             disparity_factor = (src_intr[:, 0, 0] / float(w)).float()
 
             intr_src_internal = torch.stack(
                 [_make_intrinsics_resized(src_intr[i], (w, h), internal_size) for i in range(b)],
                 dim=0,
             )
-            # All views use source-view intrinsics in SHARP's normalized square input space.
-            intr_tgt_internal = intr_src_internal.clone()
+            # Render and losses are computed at original resolution.
+            intr_src_render = src_intr.clone()
+            intr_tgt_render = src_intr.clone()
             identity_w2c = torch.eye(4, device=device, dtype=src_w2c.dtype)[None].repeat(b, 1, 1)
             # SHARP predicts Gaussians in the source camera frame. Since the source
             # extrinsics are implicit in SHARP (identity), we convert target camera
@@ -266,41 +270,45 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             render_src = renderer(
                 gaussians_world,
                 identity_w2c,
-                intr_src_internal,
-                image_width=internal_size[0],
-                image_height=internal_size[1],
+                intr_src_render,
+                image_width=w,
+                image_height=h,
             )
             render_tgt = renderer(
                 gaussians_world,
                 rel_tgt_w2c,
-                intr_tgt_internal,
-                image_width=internal_size[0],
-                image_height=internal_size[1],
+                intr_tgt_render,
+                image_width=w,
+                image_height=h,
             )
 
             vis_src = _compute_gaussian_visibility(
                 gaussians_world,
                 identity_w2c,
-                intr_src_internal,
-                internal_size[0],
-                internal_size[1],
+                intr_src_render,
+                w,
+                h,
             )
             vis_tgt = _compute_gaussian_visibility(
                 gaussians_world,
                 rel_tgt_w2c,
-                intr_tgt_internal,
-                internal_size[0],
-                internal_size[1],
+                intr_tgt_render,
+                w,
+                h,
             )
             invisible_tgt = vis_tgt & (~vis_src)
 
-            mask_grid = (
-                invisible_tgt.float()
-                .view(b, num_layers, output_res, output_res)
-                .max(dim=1)
-                .values[:, None]
+            source_visible_gaussians = _mask_gaussians(gaussians_world, vis_src)
+            render_tgt_from_src = renderer(
+                source_visible_gaussians,
+                rel_tgt_w2c,
+                intr_tgt_render,
+                image_width=w,
+                image_height=h,
             )
-            mask = F.interpolate(mask_grid, size=internal_size[::-1], mode="nearest")
+            mask = (
+                (render_tgt.alpha > 1e-3) & (render_tgt_from_src.alpha < 1e-3)
+            ).float()
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
@@ -344,23 +352,23 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             render_tgt_aug = renderer(
                 gaussians_aug,
                 rel_tgt_w2c,
-                intr_tgt_internal,
-                image_width=internal_size[0],
-                image_height=internal_size[1],
+                intr_tgt_render,
+                image_width=w,
+                image_height=h,
             )
 
-            loss_color = F.l1_loss(render_src.color, src_resized) + F.l1_loss(
+            loss_color = F.l1_loss(render_src.color, src_image) + F.l1_loss(
                 render_tgt_aug.color,
-                tgt_resized,
+                tgt_image,
             )
-            loss_percep = perceptual(render_tgt_aug.color, tgt_resized)
+            loss_percep = perceptual(render_tgt_aug.color, tgt_image)
             loss_alpha = F.binary_cross_entropy(
                 render_src.alpha.clamp(1e-5, 1 - 1e-5),
                 torch.ones_like(render_src.alpha),
             )
             loss_tv = total_variation_loss(render_tgt_aug.depth)
             loss_occ_color = (
-                (torch.abs(render_tgt_aug.color - tgt_resized) * mask).sum()
+                (torch.abs(render_tgt_aug.color - tgt_image) * mask).sum()
                 / mask.sum().clamp_min(1.0)
             )
             loss_occ_delta = masked_delta.abs().mean()
@@ -385,12 +393,11 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                     config.output_dir,
                     epoch,
                     global_step,
-                    src_resized,
+                    src_image,
                     render_src.color,
-                    tgt_resized,
+                    tgt_image,
                     render_tgt_aug.color,
                     mask,
-                    render_tgt_aug.color * mask,
                 )
 
             if optimizer is not None:
