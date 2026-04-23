@@ -98,6 +98,30 @@ def unproject_gaussians(
     return gaussians
 
 
+def apply_transform1(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+    """Apply an affine transformation to 3D Gaussians (backup version)."""
+    transform_linear = transform[..., :3, :3]
+    transform_offset = transform[..., :3, 3]
+
+    mean_vectors = (
+        gaussians.mean_vectors @ transform_linear.transpose(-1, -2)
+    ) + transform_offset[..., None, :]
+    covariance_matrices = compose_covariance_matrices(
+        gaussians.quaternions, gaussians.singular_values
+    )
+    covariance_matrices = transform_linear[:, None] @ covariance_matrices
+    covariance_matrices = covariance_matrices @ transform_linear.transpose(-1, -2)[:, None]
+    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+
+    return Gaussians3D(
+        mean_vectors=mean_vectors,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities,
+    )
+
+
 def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
