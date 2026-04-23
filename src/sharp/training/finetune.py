@@ -144,6 +144,61 @@ def _compute_gaussian_visibility(
     return in_frustum & (z <= sampled_depth + depth_eps)
 
 
+def _compute_pixel_disocclusion_mask(
+    src_depth: torch.Tensor,
+    src_alpha: torch.Tensor,
+    tgt_alpha: torch.Tensor,
+    rel_tgt_w2c: torch.Tensor,
+    intr_src: torch.Tensor,
+    intr_tgt: torch.Tensor,
+    alpha_thr: float = 1e-3,
+) -> torch.Tensor:
+    """Compute disocclusion mask in target view using pixel reprojection only."""
+    b, _, h, w = src_depth.shape
+    device = src_depth.device
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=device, dtype=src_depth.dtype),
+        torch.arange(w, device=device, dtype=src_depth.dtype),
+        indexing="ij",
+    )
+    xx = xx[None].expand(b, -1, -1)
+    yy = yy[None].expand(b, -1, -1)
+
+    z = src_depth[:, 0]
+    src_valid = (src_alpha[:, 0] > alpha_thr) & (z > 1e-6)
+
+    fx = intr_src[:, 0, 0][:, None, None]
+    fy = intr_src[:, 1, 1][:, None, None]
+    cx = intr_src[:, 0, 2][:, None, None]
+    cy = intr_src[:, 1, 2][:, None, None]
+
+    x = (xx - cx) / fx * z
+    y = (yy - cy) / fy * z
+    ones = torch.ones_like(z)
+    pts_src = torch.stack([x, y, z, ones], dim=-1)  # [B, H, W, 4]
+
+    pts_tgt = pts_src @ rel_tgt_w2c.transpose(-1, -2)
+    z_tgt = pts_tgt[..., 2].clamp_min(1e-6)
+
+    fx_t = intr_tgt[:, 0, 0][:, None, None]
+    fy_t = intr_tgt[:, 1, 1][:, None, None]
+    cx_t = intr_tgt[:, 0, 2][:, None, None]
+    cy_t = intr_tgt[:, 1, 2][:, None, None]
+    u_t = (pts_tgt[..., 0] / z_tgt) * fx_t + cx_t
+    v_t = (pts_tgt[..., 1] / z_tgt) * fy_t + cy_t
+
+    reproj_visible = torch.zeros((b, 1, h, w), device=device, dtype=torch.bool)
+    for ib in range(b):
+        valid = src_valid[ib] & (z_tgt[ib] > 0)
+        u = u_t[ib][valid].round().long()
+        v = v_t[ib][valid].round().long()
+        in_img = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        reproj_visible[ib, 0, v[in_img], u[in_img]] = True
+
+    tgt_visible = tgt_alpha > alpha_thr
+    return (tgt_visible & (~reproj_visible)).float()
+
+
 def _apply_gaussian_delta(
     base: Gaussians3D,
     delta: torch.Tensor,
@@ -319,16 +374,15 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             )
             invisible_tgt = vis_tgt & (~vis_src)
 
-            # Disoccluded region: invisible in source view but visible in target view.
-            invisible_target_gaussians = _mask_gaussians(gaussians_world, invisible_tgt)
-            render_tgt_invisible = renderer(
-                invisible_target_gaussians,
-                rel_tgt_w2c,
-                intr_tgt_render,
-                image_width=w,
-                image_height=h,
+            # Pixel-based disocclusion mask (no Gaussian-level mask rendering).
+            mask = _compute_pixel_disocclusion_mask(
+                src_depth=render_src.depth,
+                src_alpha=render_src.alpha,
+                tgt_alpha=render_tgt.alpha,
+                rel_tgt_w2c=rel_tgt_w2c,
+                intr_src=intr_src_render,
+                intr_tgt=intr_tgt_render,
             )
-            mask = (render_tgt_invisible.alpha > 1e-3).float()
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
