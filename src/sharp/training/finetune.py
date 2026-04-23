@@ -226,7 +226,6 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             src_w2c = batch["src_w2c"].to(device)
             tgt_w2c = batch["tgt_w2c"].to(device)
             src_intr = batch["src_intrinsics"].to(device)
-            tgt_intr = batch["tgt_intrinsics"].to(device)
 
             b, _, h, w = src_image.shape
             src_resized = F.interpolate(
@@ -247,10 +246,8 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 [_make_intrinsics_resized(src_intr[i], (w, h), internal_size) for i in range(b)],
                 dim=0,
             )
-            intr_tgt_internal = torch.stack(
-                [_make_intrinsics_resized(tgt_intr[i], (w, h), internal_size) for i in range(b)],
-                dim=0,
-            )
+            # All views use source-view intrinsics in SHARP's normalized square input space.
+            intr_tgt_internal = intr_src_internal.clone()
             identity_w2c = torch.eye(4, device=device, dtype=src_w2c.dtype)[None].repeat(b, 1, 1)
             # SHARP predicts Gaussians in the source camera frame. Since the source
             # extrinsics are implicit in SHARP (identity), we convert target camera
