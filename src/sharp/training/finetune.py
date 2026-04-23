@@ -46,8 +46,6 @@ class FineTuneConfig:
     device: str = "cuda"
     min_frame_gap: int = 1
     max_frame_gap: int = 30
-    mask_mode: str = "geometry"
-    rgb_mask_threshold: float = 0.12
     disable_updates: bool = False
 
 
@@ -256,16 +254,6 @@ def _morphological_smooth_mask(
     return out
 
 
-def _compute_rgb_difference_mask(
-    src_rgb: torch.Tensor,
-    tgt_rgb: torch.Tensor,
-    threshold: float,
-) -> torch.Tensor:
-    """Compute a binary mask from direct source/target RGB difference."""
-    diff = (src_rgb - tgt_rgb).abs().mean(dim=1, keepdim=True)
-    return (diff > threshold).float()
-
-
 def _apply_gaussian_delta(
     base: Gaussians3D,
     delta: torch.Tensor,
@@ -327,9 +315,6 @@ def save_debug_visualization(
 
 def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int = 2) -> None:
     """Run fine-tuning with source-target pair rendering supervision."""
-    if config.mask_mode not in {"geometry", "rgb", "hybrid"}:
-        raise ValueError(f"Unsupported mask_mode={config.mask_mode!r}.")
-
     device = torch.device(config.device)
     predictor = predictor.to(device)
     predictor.eval()
@@ -470,7 +455,7 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
             )
 
             # Pixel-based disocclusion mask (no Gaussian-level mask rendering).
-            geom_mask = _compute_pixel_disocclusion_mask(
+            mask = _compute_pixel_disocclusion_mask(
                 src_depth=render_src.depth,
                 src_alpha=render_src.alpha,
                 tgt_alpha=render_tgt.alpha,
@@ -478,17 +463,6 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_src=intr_src_render,
                 intr_tgt=intr_tgt_render,
             )
-            rgb_mask = _compute_rgb_difference_mask(
-                src_rgb=src_image,
-                tgt_rgb=tgt_image,
-                threshold=config.rgb_mask_threshold,
-            )
-            if config.mask_mode == "rgb":
-                mask = rgb_mask
-            elif config.mask_mode == "hybrid":
-                mask = torch.maximum(geom_mask, rgb_mask)
-            else:
-                mask = geom_mask
             mask = _morphological_smooth_mask(mask)
             # Keep only central valid region (remove image borders), then intersect.
             center_mask = torch.zeros_like(mask)
