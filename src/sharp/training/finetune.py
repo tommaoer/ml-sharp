@@ -203,6 +203,8 @@ def _morphological_smooth_mask(
     mask: torch.Tensor,
     open_kernel: int = 3,
     close_kernel: int = 9,
+    speckle_kernel: int = 7,
+    speckle_ratio: float = 0.08,
 ) -> torch.Tensor:
     """Apply morphology to remove thin lines and preserve large white regions."""
     out = mask
@@ -218,6 +220,11 @@ def _morphological_smooth_mask(
         # Closing fills interior holes in large disocclusion regions.
         dilated = F.max_pool2d(out, kernel_size=close_kernel, stride=1, padding=pad)
         out = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=close_kernel, stride=1, padding=pad)
+
+    if speckle_kernel > 1:
+        pad = speckle_kernel // 2
+        local_ratio = F.avg_pool2d(out, kernel_size=speckle_kernel, stride=1, padding=pad)
+        out = out * (local_ratio > speckle_ratio).float()
 
     return out
 
