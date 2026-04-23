@@ -306,9 +306,19 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 image_width=w,
                 image_height=h,
             )
-            mask = (
-                (render_tgt.alpha > 1e-3) & (render_tgt_from_src.alpha < 1e-3)
-            ).float()
+            # External/newly exposed target region not explained by source-visible Gaussians.
+            mask_external = (render_tgt.alpha > 1e-3) & (render_tgt_from_src.alpha < 1e-3)
+            # Disoccluded region: not visible in source view but visible in target view.
+            invisible_target_gaussians = _mask_gaussians(gaussians_world, invisible_tgt)
+            render_tgt_invisible = renderer(
+                invisible_target_gaussians,
+                rel_tgt_w2c,
+                intr_tgt_render,
+                image_width=w,
+                image_height=h,
+            )
+            mask_disoccluded = render_tgt_invisible.alpha > 1e-3
+            mask = (mask_external | mask_disoccluded).float()
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
