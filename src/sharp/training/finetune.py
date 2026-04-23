@@ -312,11 +312,10 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
     """Run fine-tuning with source-target pair rendering supervision."""
     device = torch.device(config.device)
     predictor = predictor.to(device)
-    predictor.train()
-
-    if not config.train_gaussian_decoder or config.disable_updates:
-        for p in predictor.parameters():
-            p.requires_grad_(False)
+    predictor.eval()
+    # Keep SHARP base predictor frozen; only train the newly added delta branch.
+    for p in predictor.parameters():
+        p.requires_grad_(False)
 
     gaussian_delta_adaptor = GaussianDeltaAdaptor(
         predictor.feature_model,
@@ -333,9 +332,10 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
         trainable: list[torch.Tensor] = []
         optimizer = None
     else:
-        trainable = [p for p in predictor.parameters() if p.requires_grad]
-        trainable += list(gaussian_delta_adaptor.parameters())
+        trainable = list(gaussian_delta_adaptor.parameters())
         optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+        num_trainable = sum(p.numel() for p in trainable if p.requires_grad)
+        LOGGER.info("Trainable parameters (gaussian_delta_adaptor only): %d", num_trainable)
 
     loss_weights = FineTuneLossWeights()
     perceptual = VGGPerceptualLoss().to(device)

@@ -6,6 +6,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 
@@ -34,6 +35,21 @@ from .render import render_gaussians
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+
+
+class GaussianDeltaAdaptor(torch.nn.Module):
+    """Delta branch cloned from SHARP Gaussian decoder/head."""
+
+    def __init__(self, predictor: RGBGaussianPredictor) -> None:
+        """Initialize by cloning pretrained decoder/head weights."""
+        super().__init__()
+        self.feature_model = copy.deepcopy(predictor.feature_model)
+        self.prediction_head = copy.deepcopy(predictor.prediction_head)
+
+    def forward(self, feature_input: torch.Tensor, encodings: list[torch.Tensor]) -> torch.Tensor:
+        """Predict Gaussian deltas for inference-time adaptation."""
+        features = self.feature_model(feature_input, encodings=encodings)
+        return self.prediction_head(features)
 
 
 @click.command()
@@ -122,7 +138,16 @@ def predict_cli(
         state_dict = torch.load(checkpoint_path, weights_only=True)
 
     gaussian_predictor = create_predictor(PredictorParams())
-    gaussian_predictor.load_state_dict(state_dict)
+    adaptor: GaussianDeltaAdaptor | None = None
+    if isinstance(state_dict, dict) and "predictor" in state_dict:
+        gaussian_predictor.load_state_dict(state_dict["predictor"])
+        if "gaussian_delta_adaptor" in state_dict:
+            adaptor = GaussianDeltaAdaptor(gaussian_predictor)
+            adaptor.load_state_dict(state_dict["gaussian_delta_adaptor"])
+            adaptor.to(device).eval()
+            LOGGER.info("Loaded gaussian_delta_adaptor from finetuned checkpoint.")
+    else:
+        gaussian_predictor.load_state_dict(state_dict)
     gaussian_predictor.eval()
     gaussian_predictor.to(device)
 
@@ -142,7 +167,13 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
+        gaussians = predict_image(
+            gaussian_predictor,
+            image,
+            f_px,
+            torch.device(device),
+            gaussian_delta_adaptor=adaptor,
+        )
 
         LOGGER.info("Saving 3DGS to %s", output_path)
         save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
@@ -161,6 +192,7 @@ def predict_image(
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    gaussian_delta_adaptor: GaussianDeltaAdaptor | None = None,
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -179,7 +211,34 @@ def predict_image(
 
     # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
-    gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    if gaussian_delta_adaptor is None:
+        gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    else:
+        monodepth_output = predictor.monodepth_model(image_resized_pt)
+        monodepth_disparity = monodepth_output.disparity
+        monodepth = disparity_factor[:, None, None, None] / monodepth_disparity.clamp(
+            min=1e-4, max=1e4
+        )
+        monodepth, _ = predictor.depth_alignment(
+            monodepth,
+            None,
+            monodepth_output.decoder_features,
+        )
+        init_output = predictor.init_model(image_resized_pt, monodepth)
+        image_features = predictor.feature_model(
+            init_output.feature_input,
+            encodings=monodepth_output.output_features,
+        )
+        delta_base = predictor.prediction_head(image_features)
+        delta_adaptor = gaussian_delta_adaptor(
+            init_output.feature_input,
+            monodepth_output.output_features,
+        )
+        gaussians_ndc = predictor.gaussian_composer(
+            delta=delta_base + delta_adaptor,
+            base_values=init_output.gaussian_base_values,
+            global_scale=init_output.global_scale,
+        )
 
     LOGGER.info("Running postprocessing.")
     intrinsics = (
