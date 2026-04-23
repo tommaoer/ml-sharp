@@ -37,6 +37,20 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 @click.option("--min-frame-gap", type=int, default=1)
 @click.option("--max-frame-gap", type=int, default=30)
 @click.option(
+    "--mask-mode",
+    type=click.Choice(["geometry", "rgb", "hybrid"], case_sensitive=False),
+    default="geometry",
+    show_default=True,
+    help="Mask source: geometry reprojection, direct RGB difference, or hybrid union.",
+)
+@click.option(
+    "--rgb-mask-threshold",
+    type=float,
+    default=0.12,
+    show_default=True,
+    help="Threshold for RGB-difference mask when mask-mode uses rgb/hybrid.",
+)
+@click.option(
     "--disable-updates/--enable-updates",
     default=False,
     help="Disable all parameter updates and keep output identical to base SHARP prediction.",
@@ -57,6 +71,8 @@ def finetune_cli(
     device: str,
     min_frame_gap: int,
     max_frame_gap: int,
+    mask_mode: str,
+    rgb_mask_threshold: float,
     disable_updates: bool,
     verbose: bool,
 ):
@@ -98,6 +114,8 @@ def finetune_cli(
         device=device,
         min_frame_gap=min_frame_gap,
         max_frame_gap=max_frame_gap,
+        mask_mode=mask_mode.lower(),
+        rgb_mask_threshold=rgb_mask_threshold,
         disable_updates=disable_updates,
     )
     run_finetuning(cfg, predictor)
