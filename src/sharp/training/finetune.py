@@ -97,6 +97,8 @@ class GaussianDeltaAdaptor(nn.Module):
         super().__init__()
         self.feature_model = copy.deepcopy(feature_model)
         self.prediction_head = copy.deepcopy(prediction_head)
+        # Ensure cloned branch is trainable by default even if source modules were frozen.
+        self.requires_grad_(True)
 
     def forward(
         self,
@@ -341,10 +343,18 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
         trainable = []
         optimizer = None
     else:
-        trainable = list(gaussian_delta_adaptor.parameters())
-        optimizer = torch.optim.AdamW(trainable, lr=config.lr)
-        num_trainable = sum(p.numel() for p in trainable if p.requires_grad)
-        LOGGER.info("Trainable parameters (gaussian_delta_adaptor only): %d", num_trainable)
+        gaussian_delta_adaptor.requires_grad_(True)
+        trainable = [p for p in gaussian_delta_adaptor.parameters() if p.requires_grad]
+        num_trainable = sum(p.numel() for p in trainable)
+        if num_trainable == 0:
+            LOGGER.warning(
+                "No trainable parameters found in gaussian_delta_adaptor; "
+                "skipping optimizer/backward updates."
+            )
+            optimizer = None
+        else:
+            optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+            LOGGER.info("Trainable parameters (gaussian_delta_adaptor only): %d", num_trainable)
 
     loss_weights = FineTuneLossWeights()
     perceptual = VGGPerceptualLoss().to(device)
