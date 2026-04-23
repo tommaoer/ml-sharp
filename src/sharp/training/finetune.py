@@ -463,7 +463,13 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_src=intr_src_render,
                 intr_tgt=intr_tgt_render,
             )
-            mask = _morphological_smooth_mask(mask)
+            mask = _morphological_smooth_mask(
+                mask,
+                open_kernel=3,
+                close_kernel=5,
+                speckle_kernel=5,
+                speckle_ratio=0.05,
+            )
             # Keep only central valid region (remove image borders), then intersect.
             center_mask = torch.zeros_like(mask)
             margin_h = int(0.08 * h)
