@@ -405,6 +405,8 @@ def run_finetuning(config: FineTuneConfig, predictor: nn.Module, num_layers: int
                 intr_src=intr_src_render,
                 intr_tgt=intr_tgt_render,
             )
+            # Expand mask pixels to cover larger coherent disocclusion/external regions.
+            mask = F.max_pool2d(mask, kernel_size=9, stride=1, padding=4)
 
             # Gaussian deltas live on predictor output grid (output_res x output_res),
             # so we run the occlusion refiner on that grid as well.
