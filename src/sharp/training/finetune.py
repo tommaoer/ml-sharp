@@ -201,9 +201,8 @@ def _compute_pixel_disocclusion_mask(
 
 def _morphological_smooth_mask(
     mask: torch.Tensor,
-    open_kernel: int = 5,
-    close_kernel: int = 17,
-    min_pool_kernel: int = 41,
+    open_kernel: int = 3,
+    close_kernel: int = 9,
 ) -> torch.Tensor:
     """Apply morphology to remove thin lines and preserve large white regions."""
     out = mask
@@ -220,10 +219,6 @@ def _morphological_smooth_mask(
         dilated = F.max_pool2d(out, kernel_size=close_kernel, stride=1, padding=pad)
         out = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=close_kernel, stride=1, padding=pad)
 
-    if min_pool_kernel > 1:
-        pad = min_pool_kernel // 2
-        area_ratio = F.avg_pool2d(out, kernel_size=min_pool_kernel, stride=1, padding=pad)
-        out = (area_ratio > 0.2).float() * out
     return out
 
 
