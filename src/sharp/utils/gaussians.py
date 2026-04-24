@@ -94,8 +94,32 @@ def unproject_gaussians(
 ) -> Gaussians3D:
     """Unproject Gaussians from NDC space to world coordinates."""
     unprojection_matrix = get_unprojection_matrix(extrinsics, intrinsics, image_shape)
-    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3])
+    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[..., :3, :])
     return gaussians
+
+
+def apply_transform1(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+    """Apply an affine transformation to 3D Gaussians (backup version)."""
+    transform_linear = transform[..., :3, :3]
+    transform_offset = transform[..., :3, 3]
+
+    mean_vectors = (
+        gaussians.mean_vectors @ transform_linear.transpose(-1, -2)
+    ) + transform_offset[..., None, :]
+    covariance_matrices = compose_covariance_matrices(
+        gaussians.quaternions, gaussians.singular_values
+    )
+    covariance_matrices = transform_linear[:, None] @ covariance_matrices
+    covariance_matrices = covariance_matrices @ transform_linear.transpose(-1, -2)[:, None]
+    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+
+    return Gaussians3D(
+        mean_vectors=mean_vectors,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities,
+    )
 
 
 def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
@@ -113,13 +137,14 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
     transform_linear = transform[..., :3, :3]
     transform_offset = transform[..., :3, 3]
 
-    mean_vectors = gaussians.mean_vectors @ transform_linear.T + transform_offset
+    mean_vectors = (
+        gaussians.mean_vectors @ transform_linear.transpose(-1, -2)
+    ) + transform_offset[..., None, :]
     covariance_matrices = compose_covariance_matrices(
         gaussians.quaternions, gaussians.singular_values
     )
-    covariance_matrices = (
-        transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
-    )
+    covariance_matrices = transform_linear[:, None] @ covariance_matrices
+    covariance_matrices = covariance_matrices @ transform_linear.transpose(-1, -2)[:, None]
     quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
 
     return Gaussians3D(
