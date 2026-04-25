@@ -12,17 +12,23 @@ Workflow:
 from __future__ import annotations
 
 import argparse
-import subprocess
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
+from sharp.cli.predict import DEFAULT_MODEL_URL
 from sharp.cli.render import render_gaussians
+from sharp.models import PredictorParams, create_predictor
 from sharp.utils import camera
-from sharp.utils.gaussians import Gaussians3D, load_ply, save_ply
+from sharp.utils.gaussians import (
+    Gaussians3D,
+    compose_covariance_matrices,
+    decompose_covariance_matrices,
+    save_ply,
+)
 from sharp.utils.io import load_rgb, save_image
 
 
@@ -71,40 +77,103 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def predict_gaussians_via_cli(
-    image_path: Path,
+def load_sharp_predictor(
     device: torch.device,
     checkpoint: Path | None,
+):
+    if checkpoint is None:
+        state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
+    else:
+        state_dict = torch.load(checkpoint, weights_only=True)
+    predictor = create_predictor(PredictorParams())
+    predictor.load_state_dict(state_dict)
+    predictor.eval()
+    predictor.to(device)
+    return predictor
+
+
+def _ensure_batched_gaussians(gaussians: Gaussians3D) -> Gaussians3D:
+    if gaussians.mean_vectors.ndim == 2:
+        return Gaussians3D(
+            mean_vectors=gaussians.mean_vectors.unsqueeze(0),
+            singular_values=gaussians.singular_values.unsqueeze(0),
+            quaternions=gaussians.quaternions.unsqueeze(0),
+            colors=gaussians.colors.unsqueeze(0),
+            opacities=gaussians.opacities.unsqueeze(0),
+        )
+    return gaussians
+
+
+def _robust_unproject_gaussians(
+    gaussians_ndc: Gaussians3D,
+    intrinsics: torch.Tensor,
+    image_shape: tuple[int, int],
 ) -> Gaussians3D:
-    with tempfile.TemporaryDirectory(prefix="sharp_predict_") as temp_dir:
-        output_dir = Path(temp_dir)
-        cmd = [
-            "sharp",
-            "predict",
-            "-i",
-            str(image_path),
-            "-o",
-            str(output_dir),
-            "--device",
-            device.type,
-        ]
-        if checkpoint is not None:
-            cmd.extend(["-c", str(checkpoint)])
+    gaussians_ndc = _ensure_batched_gaussians(gaussians_ndc)
+    width, height = image_shape
+    device = intrinsics.device
+    ndc_matrix = torch.tensor(
+        [
+            [2.0 / width, 0.0, -1.0, 0.0],
+            [0.0, 2.0 / height, -1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        device=device,
+        dtype=intrinsics.dtype,
+    )
+    transform = torch.linalg.inv(ndc_matrix @ intrinsics)[:3]  # 3x4
+    linear = transform[:, :3]  # 3x3
+    offset = transform[:, 3]  # 3
 
-        run = subprocess.run(cmd, capture_output=True, text=True)
-        if run.returncode != 0:
-            raise RuntimeError(
-                "Failed to run `sharp predict`.\n"
-                f"Command: {' '.join(cmd)}\n"
-                f"stdout:\n{run.stdout}\n"
-                f"stderr:\n{run.stderr}"
-            )
+    means = gaussians_ndc.mean_vectors @ linear.T + offset
+    cov = compose_covariance_matrices(gaussians_ndc.quaternions, gaussians_ndc.singular_values)
+    cov = linear[None, None] @ cov @ linear.T[None, None]
+    quaternions, singular_values = decompose_covariance_matrices(cov)
 
-        ply_path = output_dir / f"{image_path.stem}.ply"
-        if not ply_path.exists():
-            raise FileNotFoundError(f"Did not find SHARP output PLY: {ply_path}")
-        gaussians, _ = load_ply(ply_path)
-        return gaussians
+    return Gaussians3D(
+        mean_vectors=means,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=gaussians_ndc.colors,
+        opacities=gaussians_ndc.opacities,
+    )
+
+
+@torch.no_grad()
+def predict_gaussians_from_image(
+    predictor,
+    image: np.ndarray,
+    f_px: float,
+    device: torch.device,
+) -> Gaussians3D:
+    internal_shape = (1536, 1536)
+    image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
+    _, height, width = image_pt.shape
+    disparity_factor = torch.tensor([f_px / width], dtype=torch.float32, device=device)
+    image_resized_pt = F.interpolate(
+        image_pt[None],
+        size=(internal_shape[1], internal_shape[0]),
+        mode="bilinear",
+        align_corners=True,
+    )
+    gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    gaussians_ndc = _ensure_batched_gaussians(gaussians_ndc)
+
+    intrinsics = torch.tensor(
+        [
+            [f_px, 0, width / 2, 0],
+            [0, f_px, height / 2, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    intrinsics_resized = intrinsics.clone()
+    intrinsics_resized[0] *= internal_shape[0] / width
+    intrinsics_resized[1] *= internal_shape[1] / height
+    return _robust_unproject_gaussians(gaussians_ndc, intrinsics_resized, internal_shape)
 
 
 def segment_foreground_person(image: np.ndarray, model_id: str, device: torch.device) -> np.ndarray:
@@ -306,11 +375,8 @@ def main() -> None:
     fg_mask = segment_foreground_person(image=image_a, model_id=args.segmentation_model, device=device)
     bg_mask = ~fg_mask
 
-    gaussians_a = predict_gaussians_via_cli(
-        image_path=args.image,
-        device=device,
-        checkpoint=args.checkpoint,
-    )
+    predictor = load_sharp_predictor(device=device, checkpoint=args.checkpoint)
+    gaussians_a = predict_gaussians_from_image(predictor, image=image_a, f_px=f_px, device=device)
 
     g1, g2 = split_gaussians_by_mask(gaussians_a, fg_mask, f_px=f_px, image_shape=(height, width))
 
@@ -321,13 +387,7 @@ def main() -> None:
         prompt=args.prompt,
         device=device,
     )
-    inpainted_input_path = args.output_dir / "background_inpainted_for_sharp.png"
-    save_image(inpainted_bg, inpainted_input_path, icc_profile=icc_profile)
-    g2_prime = predict_gaussians_via_cli(
-        image_path=inpainted_input_path,
-        device=device,
-        checkpoint=args.checkpoint,
-    )
+    g2_prime = predict_gaussians_from_image(predictor, image=inpainted_bg, f_px=f_px, device=device)
     g2_prime_aligned = align_background_gaussians(
         g2_ref=g2,
         g2_new=g2_prime,
@@ -338,8 +398,12 @@ def main() -> None:
 
     merged = concat_gaussians(g1, g2_prime_aligned)
 
+    save_image(image_a, args.output_dir / "input_image.png", icc_profile=icc_profile)
     save_image((fg_mask.astype(np.uint8) * 255), args.output_dir / "mask_fg.png", icc_profile=None)
     save_image((bg_mask.astype(np.uint8) * 255), args.output_dir / "mask_bg.png", icc_profile=None)
+    segmented_preview = image_a.copy()
+    segmented_preview[~fg_mask] = (segmented_preview[~fg_mask] * 0.25).astype(np.uint8)
+    save_image(segmented_preview, args.output_dir / "segmented_preview.png", icc_profile=icc_profile)
     save_image(inpainted_bg, args.output_dir / "background_inpainted.png", icc_profile=icc_profile)
 
     save_ply(
@@ -386,9 +450,11 @@ def main() -> None:
         )
 
     print("Done. Generated:")
+    print(f"- {args.output_dir / 'input_image.png'}")
     print(f"- {args.output_dir / 'G0_original_sharp.ply'}")
     print(f"- {args.output_dir / 'mask_fg.png'}")
     print(f"- {args.output_dir / 'mask_bg.png'}")
+    print(f"- {args.output_dir / 'segmented_preview.png'}")
     print(f"- {args.output_dir / 'background_inpainted.png'}")
     print(f"- {args.output_dir / 'G1_foreground.ply'}")
     print(f"- {args.output_dir / 'G2_background.ply'}")

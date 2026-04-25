@@ -116,3 +116,4 @@ python scripts/fg_bg_gaussian_pipeline.py \
 
 > Note: this script expects additional dependencies for segmentation/inpainting, e.g. `transformers`, `diffusers`, and `accelerate`.
 > `--render` follows SHARP's built-in rendering trajectory and requires CUDA.
+> It also saves visual debug images: `input_image.png`, `mask_fg.png`, `mask_bg.png`, `segmented_preview.png`, and `background_inpainted.png`.
