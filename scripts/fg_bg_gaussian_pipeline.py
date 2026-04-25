@@ -12,17 +12,17 @@ Workflow:
 from __future__ import annotations
 
 import argparse
+import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 
-from sharp.cli.predict import DEFAULT_MODEL_URL, predict_image
 from sharp.cli.render import render_gaussians
-from sharp.models import PredictorParams, create_predictor
 from sharp.utils import camera
-from sharp.utils.gaussians import Gaussians3D, save_ply
+from sharp.utils.gaussians import Gaussians3D, load_ply, save_ply
 from sharp.utils.io import load_rgb, save_image
 
 
@@ -31,10 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", type=Path, required=True, help="Input image A")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output folder")
     parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=None,
-        help="Optional SHARP checkpoint path. If omitted, download default.",
+        "--checkpoint", type=Path, default=None, help="Optional SHARP checkpoint path."
     )
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
     parser.add_argument(
@@ -74,17 +71,40 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def load_sharp_predictor(device: torch.device, checkpoint: Path | None):
-    if checkpoint is None:
-        state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
-    else:
-        state_dict = torch.load(checkpoint, weights_only=True)
+def predict_gaussians_via_cli(
+    image_path: Path,
+    device: torch.device,
+    checkpoint: Path | None,
+) -> Gaussians3D:
+    with tempfile.TemporaryDirectory(prefix="sharp_predict_") as temp_dir:
+        output_dir = Path(temp_dir)
+        cmd = [
+            "sharp",
+            "predict",
+            "-i",
+            str(image_path),
+            "-o",
+            str(output_dir),
+            "--device",
+            device.type,
+        ]
+        if checkpoint is not None:
+            cmd.extend(["-c", str(checkpoint)])
 
-    predictor = create_predictor(PredictorParams())
-    predictor.load_state_dict(state_dict)
-    predictor.eval()
-    predictor.to(device)
-    return predictor
+        run = subprocess.run(cmd, capture_output=True, text=True)
+        if run.returncode != 0:
+            raise RuntimeError(
+                "Failed to run `sharp predict`.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stdout:\n{run.stdout}\n"
+                f"stderr:\n{run.stderr}"
+            )
+
+        ply_path = output_dir / f"{image_path.stem}.ply"
+        if not ply_path.exists():
+            raise FileNotFoundError(f"Did not find SHARP output PLY: {ply_path}")
+        gaussians, _ = load_ply(ply_path)
+        return gaussians
 
 
 def segment_foreground_person(image: np.ndarray, model_id: str, device: torch.device) -> np.ndarray:
@@ -286,8 +306,11 @@ def main() -> None:
     fg_mask = segment_foreground_person(image=image_a, model_id=args.segmentation_model, device=device)
     bg_mask = ~fg_mask
 
-    predictor = load_sharp_predictor(device=device, checkpoint=args.checkpoint)
-    gaussians_a = predict_image(predictor, image_a, f_px=f_px, device=device)
+    gaussians_a = predict_gaussians_via_cli(
+        image_path=args.image,
+        device=device,
+        checkpoint=args.checkpoint,
+    )
 
     g1, g2 = split_gaussians_by_mask(gaussians_a, fg_mask, f_px=f_px, image_shape=(height, width))
 
@@ -298,7 +321,13 @@ def main() -> None:
         prompt=args.prompt,
         device=device,
     )
-    g2_prime = predict_image(predictor, inpainted_bg, f_px=f_px, device=device)
+    inpainted_input_path = args.output_dir / "background_inpainted_for_sharp.png"
+    save_image(inpainted_bg, inpainted_input_path, icc_profile=icc_profile)
+    g2_prime = predict_gaussians_via_cli(
+        image_path=inpainted_input_path,
+        device=device,
+        checkpoint=args.checkpoint,
+    )
     g2_prime_aligned = align_background_gaussians(
         g2_ref=g2,
         g2_new=g2_prime,
