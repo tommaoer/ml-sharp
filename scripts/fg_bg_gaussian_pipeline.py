@@ -19,7 +19,9 @@ import torch
 from PIL import Image
 
 from sharp.cli.predict import DEFAULT_MODEL_URL, predict_image
+from sharp.cli.render import render_gaussians
 from sharp.models import PredictorParams, create_predictor
+from sharp.utils import camera
 from sharp.utils.gaussians import Gaussians3D, save_ply
 from sharp.utils.io import load_rgb, save_image
 
@@ -49,6 +51,17 @@ def parse_args() -> argparse.Namespace:
         "--prompt",
         default="clean realistic background, high detail, consistent lighting",
         help="Inpainting prompt.",
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render output gaussians with SHARP built-in camera trajectory (CUDA only).",
+    )
+    parser.add_argument(
+        "--trajectory-spatial-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for trajectory spatial amplitude (lateral + zoom motion).",
     )
     return parser.parse_args()
 
@@ -227,6 +240,40 @@ def concat_gaussians(g1: Gaussians3D, g2: Gaussians3D) -> Gaussians3D:
     )
 
 
+def render_outputs(
+    output_dir: Path,
+    f_px: float,
+    image_shape: tuple[int, int],
+    trajectory_spatial_scale: float,
+    gaussian_outputs: dict[str, Gaussians3D],
+) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("`--render` requires CUDA (same as sharp render).")
+
+    params = camera.TrajectoryParams(
+        max_disparity=0.08 * trajectory_spatial_scale,
+        max_zoom=0.15 * trajectory_spatial_scale,
+    )
+    metadata = camera_metadata(f_px=f_px, image_shape=image_shape)
+
+    video_dir = output_dir / "renderings"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    for name, gaussians in gaussian_outputs.items():
+        render_gaussians(
+            gaussians=gaussians,
+            metadata=metadata,
+            params=params,
+            output_path=video_dir / f"{name}.mp4",
+        )
+
+
+def camera_metadata(f_px: float, image_shape: tuple[int, int]):
+    from sharp.utils.gaussians import SceneMetaData
+
+    height, width = image_shape
+    return SceneMetaData(focal_length_px=f_px, resolution_px=(width, height), color_space="linearRGB")
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -266,8 +313,20 @@ def main() -> None:
     save_image((bg_mask.astype(np.uint8) * 255), args.output_dir / "mask_bg.png", icc_profile=None)
     save_image(inpainted_bg, args.output_dir / "background_inpainted.png", icc_profile=icc_profile)
 
+    save_ply(
+        gaussians_a,
+        f_px=f_px,
+        image_shape=(height, width),
+        path=args.output_dir / "G0_original_sharp.ply",
+    )
     save_ply(g1, f_px=f_px, image_shape=(height, width), path=args.output_dir / "G1_foreground.ply")
     save_ply(g2, f_px=f_px, image_shape=(height, width), path=args.output_dir / "G2_background.ply")
+    save_ply(
+        g2_prime,
+        f_px=f_px,
+        image_shape=(height, width),
+        path=args.output_dir / "G2_prime_inpainted_raw.ply",
+    )
     save_ply(
         g2_prime_aligned,
         f_px=f_px,
@@ -281,14 +340,34 @@ def main() -> None:
         path=args.output_dir / "G1_plus_G2_prime_aligned.ply",
     )
 
+    if args.render:
+        render_outputs(
+            output_dir=args.output_dir,
+            f_px=f_px,
+            image_shape=(height, width),
+            trajectory_spatial_scale=args.trajectory_spatial_scale,
+            gaussian_outputs={
+                "G0_original_sharp": gaussians_a,
+                "G1_foreground": g1,
+                "G2_background": g2,
+                "G2_prime_inpainted_raw": g2_prime,
+                "G2_prime_aligned": g2_prime_aligned,
+                "G1_plus_G2_prime_aligned": merged,
+            },
+        )
+
     print("Done. Generated:")
+    print(f"- {args.output_dir / 'G0_original_sharp.ply'}")
     print(f"- {args.output_dir / 'mask_fg.png'}")
     print(f"- {args.output_dir / 'mask_bg.png'}")
     print(f"- {args.output_dir / 'background_inpainted.png'}")
     print(f"- {args.output_dir / 'G1_foreground.ply'}")
     print(f"- {args.output_dir / 'G2_background.ply'}")
+    print(f"- {args.output_dir / 'G2_prime_inpainted_raw.ply'}")
     print(f"- {args.output_dir / 'G2_prime_aligned.ply'}")
     print(f"- {args.output_dir / 'G1_plus_G2_prime_aligned.ply'}")
+    if args.render:
+        print(f"- {args.output_dir / 'renderings'}/*.mp4")
 
 
 if __name__ == "__main__":

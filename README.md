@@ -109,7 +109,10 @@ Example:
 ```bash
 python scripts/fg_bg_gaussian_pipeline.py \
   --image /path/to/image_A.jpg \
-  --output-dir /path/to/output
+  --output-dir /path/to/output \
+  --render \
+  --trajectory-spatial-scale 1.2
 ```
 
 > Note: this script expects additional dependencies for segmentation/inpainting, e.g. `transformers`, `diffusers`, and `accelerate`.
+> `--render` follows SHARP's built-in rendering trajectory and requires CUDA.
