@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--inpaint-model",
-        default="stabilityai/stable-diffusion-2-inpainting",
+        default="sd2-community/stable-diffusion-2-inpainting",
         help="Diffusers inpainting model id.",
     )
     parser.add_argument(
