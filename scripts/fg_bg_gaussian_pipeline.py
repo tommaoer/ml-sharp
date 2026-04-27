@@ -224,6 +224,7 @@ def inpaint_background(
     pipe = pipe.to(device)
 
     image_pil = Image.fromarray(image)
+    width, height = image_pil.size
     mask_pil = Image.fromarray((fg_mask.astype(np.uint8) * 255), mode="L")
 
     result = pipe(
@@ -233,6 +234,8 @@ def inpaint_background(
         guidance_scale=7.5,
         num_inference_steps=40,
     ).images[0]
+    if result.size != (width, height):
+        result = result.resize((width, height), Image.BICUBIC)
     return np.array(result)
 
 
