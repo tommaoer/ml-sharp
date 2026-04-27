@@ -287,35 +287,55 @@ def align_background_gaussians(
     image_shape: tuple[int, int],
 ) -> Gaussians3D:
     h, w = image_shape
-
-    def visible_subset(g: Gaussians3D) -> torch.Tensor:
-        uv, valid = project_to_pixels(g, f_px=f_px, height=h, width=w)
-        keep = np.zeros((g.mean_vectors.shape[1],), dtype=bool)
-        if np.any(valid):
-            uv_valid = uv[valid]
-            u_int = np.clip(np.round(uv_valid[:, 0]).astype(int), 0, w - 1)
-            v_int = np.clip(np.round(uv_valid[:, 1]).astype(int), 0, h - 1)
-            keep[valid] = known_bg_mask[v_int, u_int]
-        keep_t = torch.from_numpy(keep).to(g.mean_vectors.device)
-        return g.mean_vectors[0, keep_t, :]
-
-    ref_pts = visible_subset(g2_ref)
-    new_pts = visible_subset(g2_new)
-    if ref_pts.shape[0] < 32 or new_pts.shape[0] < 32:
+    uv_ref, valid_ref = project_to_pixels(g2_ref, f_px=f_px, height=h, width=w)
+    uv_new, valid_new = project_to_pixels(g2_new, f_px=f_px, height=h, width=w)
+    if not np.any(valid_ref) or not np.any(valid_new):
         return g2_new
 
-    ref_center = ref_pts.mean(dim=0)
-    new_center = new_pts.mean(dim=0)
-    ref_scale = ref_pts.std(dim=0).mean().clamp(min=1e-6)
-    new_scale = new_pts.std(dim=0).mean().clamp(min=1e-6)
-    scale = (ref_scale / new_scale).detach()
+    def collect_pixel_means(g: Gaussians3D, uv: np.ndarray, valid: np.ndarray) -> dict[tuple[int, int], np.ndarray]:
+        means = g.mean_vectors[0].detach().cpu().numpy()
+        u = np.clip(np.round(uv[:, 0]).astype(int), 0, w - 1)
+        v = np.clip(np.round(uv[:, 1]).astype(int), 0, h - 1)
 
-    aligned_means = (g2_new.mean_vectors - new_center) * scale + ref_center
-    aligned_scales = g2_new.singular_values * scale
+        accum: dict[tuple[int, int], list[np.ndarray]] = {}
+        for idx in np.where(valid)[0]:
+            key = (v[idx], u[idx])
+            if not known_bg_mask[key[0], key[1]]:
+                continue
+            accum.setdefault(key, []).append(means[idx])
+
+        reduced: dict[tuple[int, int], np.ndarray] = {}
+        for key, pts in accum.items():
+            reduced[key] = np.mean(np.stack(pts, axis=0), axis=0)
+        return reduced
+
+    ref_map = collect_pixel_means(g2_ref, uv_ref, valid_ref)
+    new_map = collect_pixel_means(g2_new, uv_new, valid_new)
+    common_keys = list(set(ref_map.keys()) & set(new_map.keys()))
+    if len(common_keys) < 64:
+        return g2_new
+
+    deltas = np.stack([ref_map[k] - new_map[k] for k in common_keys], axis=0)
+    translation = np.median(deltas, axis=0)
+
+    # Clamp over-aggressive translation to avoid breaking well-aligned results.
+    ref_depth = g2_ref.mean_vectors[0, :, 2].detach().cpu().numpy()
+    depth_scale = max(float(np.median(ref_depth[ref_depth > 1e-6])), 1e-3)
+    max_shift = 0.05 * depth_scale
+    shift_norm = float(np.linalg.norm(translation))
+    if shift_norm > max_shift:
+        translation = translation * (max_shift / max(shift_norm, 1e-8))
+
+    translation_t = torch.tensor(
+        translation,
+        dtype=g2_new.mean_vectors.dtype,
+        device=g2_new.mean_vectors.device,
+    )
+    aligned_means = g2_new.mean_vectors + translation_t[None, None, :]
 
     return Gaussians3D(
         mean_vectors=aligned_means,
-        singular_values=aligned_scales,
+        singular_values=g2_new.singular_values,
         quaternions=g2_new.quaternions,
         colors=g2_new.colors,
         opacities=g2_new.opacities,
