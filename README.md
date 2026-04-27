@@ -118,3 +118,4 @@ python scripts/fg_bg_gaussian_pipeline.py \
 > `--render` follows SHARP's built-in rendering trajectory and requires CUDA.
 > It also saves visual debug images: `input_image.png`, `mask_fg.png`, `mask_bg.png`, `segmented_preview.png`, and `background_inpainted.png`.
 > To reduce background leakage in `G1_foreground`, use `--fg-depth-margin-ratio` (smaller = stricter pruning by depth).
+> Foreground outputs include both `G1_foreground_raw` and `G1_foreground_depth_pruned` (with corresponding render videos when `--render` is enabled).

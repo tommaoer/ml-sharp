@@ -459,10 +459,10 @@ def main() -> None:
     predictor = load_sharp_predictor(device=device, checkpoint=args.checkpoint)
     gaussians_a = predict_gaussians_from_image(predictor, image=image_a, f_px=f_px, device=device)
 
-    g1, g2 = split_gaussians_by_mask(gaussians_a, fg_mask, f_px=f_px, image_shape=(height, width))
+    g1_raw, g2 = split_gaussians_by_mask(gaussians_a, fg_mask, f_px=f_px, image_shape=(height, width))
     g1 = refine_foreground_with_depth(
         g0=gaussians_a,
-        g1=g1,
+        g1=g1_raw,
         fg_mask=fg_mask,
         f_px=f_px,
         image_shape=(height, width),
@@ -501,6 +501,19 @@ def main() -> None:
         image_shape=(height, width),
         path=args.output_dir / "G0_original_sharp.ply",
     )
+    save_ply(
+        g1_raw,
+        f_px=f_px,
+        image_shape=(height, width),
+        path=args.output_dir / "G1_foreground_raw.ply",
+    )
+    save_ply(
+        g1,
+        f_px=f_px,
+        image_shape=(height, width),
+        path=args.output_dir / "G1_foreground_depth_pruned.ply",
+    )
+    # Keep legacy filename mapped to depth-pruned foreground.
     save_ply(g1, f_px=f_px, image_shape=(height, width), path=args.output_dir / "G1_foreground.ply")
     save_ply(g2, f_px=f_px, image_shape=(height, width), path=args.output_dir / "G2_background.ply")
     save_ply(
@@ -530,6 +543,8 @@ def main() -> None:
             trajectory_spatial_scale=args.trajectory_spatial_scale,
             gaussian_outputs={
                 "G0_original_sharp": gaussians_a,
+                "G1_foreground_raw": g1_raw,
+                "G1_foreground_depth_pruned": g1,
                 "G1_foreground": g1,
                 "G2_background": g2,
                 "G2_prime_inpainted_raw": g2_prime,
@@ -541,6 +556,8 @@ def main() -> None:
     print("Done. Generated:")
     print(f"- {args.output_dir / 'input_image.png'}")
     print(f"- {args.output_dir / 'G0_original_sharp.ply'}")
+    print(f"- {args.output_dir / 'G1_foreground_raw.ply'}")
+    print(f"- {args.output_dir / 'G1_foreground_depth_pruned.ply'}")
     print(f"- {args.output_dir / 'mask_fg.png'}")
     print(f"- {args.output_dir / 'mask_bg.png'}")
     print(f"- {args.output_dir / 'segmented_preview.png'}")
