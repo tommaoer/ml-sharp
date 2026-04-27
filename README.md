@@ -93,3 +93,29 @@ Our codebase is built using multiple opensource contributions, please see [ACKNO
 
 Please check out the repository [LICENSE](LICENSE) before using the provided code and
 [LICENSE_MODEL](LICENSE_MODEL) for the released models.
+
+## Foreground/background split + inpainting pipeline
+
+A reference script is provided at `scripts/fg_bg_gaussian_pipeline.py` for:
+
+1. Person-prioritized foreground/background segmentation (`A -> A1/A2`),
+2. SHARP Gaussian prediction and split (`G1/G2`),
+3. Background hole inpainting (`A2 -> A2'`),
+4. SHARP Gaussian prediction on inpainted image (`G2'`), and
+5. Alignment + export for joint rendering (`G1 + aligned G2'`).
+
+Example:
+
+```bash
+python scripts/fg_bg_gaussian_pipeline.py \
+  --image /path/to/image_A.jpg \
+  --output-dir /path/to/output \
+  --render \
+  --trajectory-spatial-scale 1.2
+```
+
+> Note: this script expects additional dependencies for segmentation/inpainting, e.g. `transformers`, `diffusers`, and `accelerate`.
+> `--render` follows SHARP's built-in rendering trajectory and requires CUDA.
+> It also saves visual debug images: `input_image.png`, `mask_fg.png`, `mask_bg.png`, `segmented_preview.png`, and `background_inpainted.png`.
+> To reduce background leakage in `G1_foreground`, use `--fg-depth-margin-ratio` (smaller = stricter pruning by depth).
+> Foreground outputs include both `G1_foreground_raw` and `G1_foreground_depth_pruned` (with corresponding render videos when `--render` is enabled).
