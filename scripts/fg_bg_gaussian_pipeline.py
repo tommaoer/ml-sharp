@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Scale factor for trajectory spatial amplitude (lateral + zoom motion).",
     )
+    parser.add_argument(
+        "--fg-depth-margin-ratio",
+        type=float,
+        default=0.03,
+        help="Depth tolerance ratio for removing background-leaking gaussians from G1.",
+    )
     return parser.parse_args()
 
 
@@ -279,6 +285,58 @@ def split_gaussians_by_mask(
     return select(fg_idx), select(bg_idx)
 
 
+def refine_foreground_with_depth(
+    g0: Gaussians3D,
+    g1: Gaussians3D,
+    fg_mask: np.ndarray,
+    f_px: float,
+    image_shape: tuple[int, int],
+    depth_margin_ratio: float,
+) -> Gaussians3D:
+    """Prune G1 gaussians that are likely background by using front-depth consistency."""
+    h, w = image_shape
+
+    uv0, valid0 = project_to_pixels(g0, f_px=f_px, height=h, width=w)
+    z0 = g0.mean_vectors[0, :, 2].detach().cpu().numpy()
+    depth_map = np.full((h, w), np.inf, dtype=np.float32)
+    if np.any(valid0):
+        u0 = np.clip(np.round(uv0[valid0, 0]).astype(int), 0, w - 1)
+        v0 = np.clip(np.round(uv0[valid0, 1]).astype(int), 0, h - 1)
+        z0v = z0[valid0]
+        for u, v, z in zip(u0, v0, z0v, strict=False):
+            if z > 1e-6 and z < depth_map[v, u]:
+                depth_map[v, u] = z
+
+    uv1, valid1 = project_to_pixels(g1, f_px=f_px, height=h, width=w)
+    z1 = g1.mean_vectors[0, :, 2].detach().cpu().numpy()
+    keep = np.ones((g1.mean_vectors.shape[1],), dtype=bool)
+    if np.any(valid1):
+        u1 = np.clip(np.round(uv1[valid1, 0]).astype(int), 0, w - 1)
+        v1 = np.clip(np.round(uv1[valid1, 1]).astype(int), 0, h - 1)
+        z1v = z1[valid1]
+
+        valid_indices = np.where(valid1)[0]
+        for idx, u, v, z in zip(valid_indices, u1, v1, z1v, strict=False):
+            if not fg_mask[v, u]:
+                keep[idx] = False
+                continue
+
+            front_z = depth_map[v, u]
+            if np.isfinite(front_z):
+                threshold = front_z * (1.0 + depth_margin_ratio)
+                if z > threshold:
+                    keep[idx] = False
+
+    keep_t = torch.from_numpy(keep).to(g1.mean_vectors.device)
+    return Gaussians3D(
+        mean_vectors=g1.mean_vectors[:, keep_t, :],
+        singular_values=g1.singular_values[:, keep_t, :],
+        quaternions=g1.quaternions[:, keep_t, :],
+        colors=g1.colors[:, keep_t, :],
+        opacities=g1.opacities[:, keep_t],
+    )
+
+
 def align_background_gaussians(
     g2_ref: Gaussians3D,
     g2_new: Gaussians3D,
@@ -402,6 +460,14 @@ def main() -> None:
     gaussians_a = predict_gaussians_from_image(predictor, image=image_a, f_px=f_px, device=device)
 
     g1, g2 = split_gaussians_by_mask(gaussians_a, fg_mask, f_px=f_px, image_shape=(height, width))
+    g1 = refine_foreground_with_depth(
+        g0=gaussians_a,
+        g1=g1,
+        fg_mask=fg_mask,
+        f_px=f_px,
+        image_shape=(height, width),
+        depth_margin_ratio=args.fg_depth_margin_ratio,
+    )
 
     inpainted_bg = inpaint_background(
         image=image_a,
